@@ -3,6 +3,7 @@ import io
 import os
 import sys
 import numpy as np
+import h5py
 
 # libero pulls in `gym`, which prints an unmaintained-package notice straight
 # to stderr on import (gym_notices) instead of raising a warnings.UserWarning,
@@ -13,6 +14,17 @@ with contextlib.redirect_stderr(io.StringIO()):
     from libero.libero.envs.env_wrapper import ControlEnv
 
 print(get_libero_path("datasets"))
+
+dataset_filename = "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
+
+dataset_file = os.path.join(
+    get_libero_path("datasets"),
+    "libero_spatial",
+    dataset_filename
+)
+
+with h5py.File(dataset_file, "r") as f:
+    f.visit(print)
 
 sys.exit()
 
