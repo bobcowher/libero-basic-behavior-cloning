@@ -6,7 +6,7 @@ class LiberoObsWrapper:
 
     Collapses the raw obs dict down to exactly what the policy consumes:
       - image   (3, H, W) float32 in [0, 1], CHW      <- one camera
-      - proprio (9,)       float32, RAW (unnormalized) <- joint_pos + gripper_qpos
+      - joint_state (9,)       float32, RAW (unnormalized) <- joint_pos + gripper_qpos
 
     Everything else in the obs dict is dropped.
 
@@ -19,8 +19,8 @@ class LiberoObsWrapper:
         robot0_gripper_qpos  (vs agentview_rgb / joint_states / gripper_states).
       - image: HWC uint8 [0,255] -> CHW float32 [0,1]. NO vertical flip; the
         stored demos and the live env share the opengl convention.
-      - proprio is raw here because the training loader delivers it raw too. If
-        you normalize proprio for training, normalize it here with the SAME
+      - joint_state is raw here because the training loader delivers it raw too. If
+        you normalize joint_state for training, normalize it here with the SAME
         per-dim stats or you reintroduce skew.
     """
 
@@ -33,12 +33,12 @@ class LiberoObsWrapper:
         image = np.transpose(image, (2, 0, 1))            # -> (3, H, W)
         image = image.astype(np.float32) / 255.0          # -> [0, 1]
 
-        proprio = np.concatenate([
+        joint_state = np.concatenate([
             obs["robot0_joint_pos"],                      # (7,) joints
             obs["robot0_gripper_qpos"],                   # (2,) gripper
         ]).astype(np.float32)                             # -> (9,)
 
-        return image, proprio
+        return image, joint_state
 
     def render(self):
         self.env.env.render()
@@ -56,8 +56,8 @@ class LiberoObsWrapper:
     def step(self, action):
         # robosuite returns a 4-tuple (obs, reward, done, info), not gym's 5.
         obs, reward, done, info = self.env.step(action)
-        image, proprio = self._process(obs)
-        return (image, proprio), reward, done, info
+        image, joint_state = self._process(obs)
+        return (image, joint_state), reward, done, info
 
     def seed(self, seed):
         return self.env.seed(seed)

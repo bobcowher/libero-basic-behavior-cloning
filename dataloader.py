@@ -45,12 +45,12 @@ class DataLoader():
         # hdf5_cache_mode="all" removes the waste if it ever bottlenecks.
         idxs = np.random.randint(0, len(self.dataset), size=batch_size)
 
-        agentview, wrist, proprio, actions = [], [], [], []
+        agentview, wrist, joint_state, actions = [], [], [], []
         for i in idxs:
             d = self.dataset[i]
             agentview.append(d["obs"]["agentview_rgb"][0])
             wrist.append(d["obs"]["eye_in_hand_rgb"][0])
-            proprio.append(np.concatenate([
+            joint_state.append(np.concatenate([
                 d["obs"]["joint_states"][0],
                 d["obs"]["gripper_states"][0],
             ]))
@@ -62,6 +62,6 @@ class DataLoader():
         return {
             "agentview": stack(agentview),   # (B, 3, 128, 128)
             "wrist":     stack(wrist),        # (B, 3, 128, 128)
-            "proprio":   stack(proprio),      # (B, 9)
+            "joint_state":   stack(joint_state),      # (B, 9)
             "actions":   stack(actions),      # (B, 7)
         }

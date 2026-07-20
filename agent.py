@@ -44,21 +44,21 @@ class Agent:
         
         self.env.seed(0)
 
-        # Wrap: raw obs dict -> (image (3,128,128) f32 [0,1], proprio (9,) f32).
+        # Wrap: raw obs dict -> (image (3,128,128) f32 [0,1], joint_state (9,) f32).
         self.env = LiberoObsWrapper(self.env)
 
         # Image-input-only policy. input_shape is the wrapped image shape;
-        # proprio is NOT fed in this V1 (model.forward ignores joint_state).
+        # joint_state is NOT fed in this V1 (model.forward ignores joint_state).
         self.model = Model(input_shape=(3, 128, 128), num_actions=7, hidden_dim=256)
 
-        self.obs = self.env.reset()               # (image, proprio)
-        image, proprio = self.obs
-        print("image", image.shape, image.dtype, "proprio", proprio.shape)
+        self.obs = self.env.reset()               # (image, joint_state)
+        image, joint_state = self.obs
+        print("image", image.shape, image.dtype, "joint_state", joint_state.shape)
     
     def train(self, epochs, batch_size):
 
         for i in range(100):
-            image, proprio = self.obs
+            image, joint_state = self.obs
 
             # Image input only. Batch dim added; joint_state passed as None
             # since the model ignores it in this V1.
