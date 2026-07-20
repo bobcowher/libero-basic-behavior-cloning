@@ -9,6 +9,8 @@ import inspect
 from dataloader import DataLoader
 from env_wrapper import LiberoObsWrapper
 from model import Model
+import torch.nn as nn
+import torch.nn.functional as F
 
 # libero pulls in `gym`, which prints an unmaintained-package notice straight
 # to stderr on import (gym_notices) instead of raising a warnings.UserWarning,
@@ -20,7 +22,7 @@ with contextlib.redirect_stderr(io.StringIO()):
 
 class Agent:
 
-    def __init__(self, eval=False):
+    def __init__(self, eval=False, lr=0.0001):
 
         dataset_filename = "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
         self.dl = DataLoader(dataset_filename=dataset_filename)
@@ -50,31 +52,50 @@ class Agent:
         # Image-input-only policy. input_shape is the wrapped image shape;
         # joint_state is NOT fed in this V1 (model.forward ignores joint_state).
         self.model = Model(input_shape=(3, 128, 128), num_actions=7, hidden_dim=256)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
-        self.obs = self.env.reset()               # (image, joint_state)
-        image, joint_state = self.obs
+        image, joint_state = self.env.reset()               # (image, joint_state)
         print("image", image.shape, image.dtype, "joint_state", joint_state.shape)
     
     def train(self, epochs, batch_size):
 
-        for i in range(100):
-            image, joint_state = self.obs
+        for i in range(epochs):
 
-            # Image input only. Batch dim added; joint_state passed as None
-            # since the model ignores it in this V1.
-            image_t = torch.as_tensor(image).unsqueeze(0)   # (1, 3, 128, 128)
-            features = self.model(image_t, None)            # (1, hidden_dim)
+            batch = self.dl.get_batch(batch_size=batch_size)
 
-            # NOTE: model has no action head yet, so `features` is not a 7-dim
-            # action. Until model.py adds an output layer, step a placeholder.
-            action = np.concatenate((
-                np.random.uniform(-0.3, 0.3, 6), [np.random.choice([-1, 1])]
-            ))
+            images = batch['agentview']
+            joint_states = batch['joint_state']
+            actions = batch['actions']
 
-            self.obs, reward, done, info = self.env.step(action)  # action: 7-dim
+            # TODO: Go integrate joint states
+            actions_pred = self.model(images, joint_states)
 
-            if done:
-                break
+            loss = F.l1_loss(actions, actions_pred)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            if i % 1000 == 0:
+                print(f"Loss: {loss.item()}")
+
+            # image, joint_state = self.obs
+            #
+            # # Image input only. Batch dim added; joint_state passed as None
+            # # since the model ignores it in this V1.
+            # image_t = torch.as_tensor(image).unsqueeze(0)   # (1, 3, 128, 128)
+            # features = self.model(image_t, None)            # (1, hidden_dim)
+            #
+            # # NOTE: model has no action head yet, so `features` is not a 7-dim
+            # # action. Until model.py adds an output layer, step a placeholder.
+            # action = np.concatenate((
+            #     np.random.uniform(-0.3, 0.3, 6), [np.random.choice([-1, 1])]
+            # ))
+            #
+            # self.obs, reward, done, info = self.env.step(action)  # action: 7-dim
+            #
+            # if done:
+            #     break
 
     def close(self):
         self.env.close()
