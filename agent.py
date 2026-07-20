@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import h5py
 import inspect
+
+from torch._C import device
 from dataloader import DataLoader
 from env_wrapper import LiberoObsWrapper
 from model import Model
@@ -48,10 +50,11 @@ class Agent:
 
         # Wrap: raw obs dict -> (image (3,128,128) f32 [0,1], joint_state (9,) f32).
         self.env = LiberoObsWrapper(self.env)
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
         # Image-input-only policy. input_shape is the wrapped image shape;
         # joint_state is NOT fed in this V1 (model.forward ignores joint_state).
-        self.model = Model(input_shape=(3, 128, 128), num_actions=7, hidden_dim=256)
+        self.model = Model(input_shape=(3, 128, 128), num_actions=7, hidden_dim=256).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         image, joint_state = self.env.reset()               # (image, joint_state)
@@ -63,9 +66,9 @@ class Agent:
 
             batch = self.dl.get_batch(batch_size=batch_size)
 
-            images = batch['agentview']
-            joint_states = batch['joint_state']
-            actions = batch['actions']
+            images = batch['agentview'].to(self.device)
+            joint_states = batch['joint_state'].to(self.device)
+            actions = batch['actions'].to(self.device)
 
             # TODO: Go integrate joint states
             actions_pred = self.model(images, joint_states)

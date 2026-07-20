@@ -1,0 +1,41 @@
+# LIBERO behavior-cloning stack — full install for the `libero-modern` env
+# (Python 3.10.20). Install into that env:
+#     conda activate libero-modern
+#     pip install -r requirements.txt
+#     pip install -e ~/pythonprojects/LIBERO      # LIBERO itself (install_requires is empty)
+#
+# Two deliberate deviations from LIBERO's stock requirements.txt, both forced by
+# hardware/runtime, both noted at their line:
+#   1. torch/torchvision come from the CUDA 12.8 index (RTX 5090 = sm_120,
+#      Blackwell). LIBERO ships no torch pin; the default index has no sm_120
+#      build. This is the whole reason we left Python 3.8.
+#   2. numpy pinned to 1.23.5 (LIBERO stock is 1.22.4). Anything >=1.24 removes
+#      np.bool, which robomimic 0.2.0 still calls -> hard crash. 1.23.x is the
+#      last line that keeps np.bool AND has cp310 wheels.
+
+# ---- PyTorch (Blackwell / sm_120) --------------------------------------------
+# cu128 wheels carry sm_120 kernels; unpinned -> latest (>=2.7). cu129 also works.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+
+# ---- LIBERO core stack (versions from LIBERO/requirements.txt) ----------------
+robosuite==1.4.0          # DO NOT bump to 1.5 — it removes SingleArmEnv, breaks LIBERO
+robomimic==0.2.0          # uses np.bool -> forces numpy<1.24 (see below)
+bddl==1.0.1
+gym==0.25.2
+hydra-core==1.2.0
+einops==0.4.1
+thop==0.1.1-2209072238
+easydict==1.9
+future==0.18.2
+cloudpickle==2.1.0
+
+# ---- numpy (override) --------------------------------------------------------
+numpy==1.23.5             # NOT 1.24+: robomimic 0.2.0 calls the removed np.bool
+
+# ---- Vision / logging / language (needed by libero.lifelong) -----------------
+opencv-python==4.6.0.66
+matplotlib==3.5.3
+transformers==4.21.1      # only used by the lifelong/language path; heavy, old
+wandb==0.13.1
