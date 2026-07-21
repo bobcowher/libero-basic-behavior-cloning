@@ -1,6 +1,6 @@
 from agent import Agent
 
-agent = Agent()
+agent = Agent(eval=True)
 
 agent.test()
 

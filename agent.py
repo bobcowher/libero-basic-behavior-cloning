@@ -3,12 +3,10 @@ import io
 import os
 import sys
 import numpy as np
-from robosuite.controllers import joint_pos
 import torch
 import h5py
 import inspect
 
-from torch._C import device
 from dataloader import DataLoader
 from env_wrapper import LiberoObsWrapper
 from model import Model
@@ -92,14 +90,28 @@ class Agent:
 
     def test(self):
         self.model.load_checkpoint()
+        self.model.eval()
 
+        # Wrapper returns numpy (3,128,128) image + (9,) joint_state.
         image, joint_state = self.env.reset()
 
         for i in range(3000):
+            with torch.no_grad():
+                # numpy -> batched GPU tensor for the model.
+                img_t = torch.as_tensor(image, device=self.device).unsqueeze(0)        # (1,3,128,128)
+                js_t = torch.as_tensor(joint_state, device=self.device).unsqueeze(0)   # (1,9)
+                action = self.model(img_t, js_t)                                       # (1,7)
 
-            action = self.model(image, joint_state)
-            obs, reward, done, info = self.env.step(action)
-            image, joint_state = obs.image.to(self.device), obs.joint_state.to(self.device)
+            # tensor -> numpy (7,) for robosuite's step().
+            action = action.squeeze(0).cpu().numpy()
+            (image, joint_state), reward, done, info = self.env.step(action)
+
+            self.env.render()
+
+            if done:
+                print(f"success at step {i}")
+                break
+
 
 
 
