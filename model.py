@@ -33,6 +33,8 @@ class Model(nn.Module):
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_file = os.path.join(self.checkpoint_dir, name)
 
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
         self.apply(weights_init_)
 
 

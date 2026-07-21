@@ -3,6 +3,7 @@ import io
 import os
 import sys
 import numpy as np
+from robosuite.controllers import joint_pos
 import torch
 import h5py
 import inspect
@@ -62,6 +63,8 @@ class Agent:
     
     def train(self, epochs, batch_size):
 
+        lowest_loss = 100 # Arbitrarily high number
+
         for i in range(epochs):
 
             batch = self.dl.get_batch(batch_size=batch_size)
@@ -79,26 +82,29 @@ class Agent:
             loss.backward()
             self.optimizer.step()
 
-            if i % 1000 == 0:
-                print(f"Loss: {loss.item()}")
+            if i % 100 == 0:
+                print(f"Episode: {i} Loss: {loss.item()}")
+                
+                if(loss.item() < lowest_loss):
+                    lowest_loss = loss.item()
+                    self.model.save_checkpoint()
+                    print(f"\nSaved checkpoint at episode {i}\n")
 
-            # image, joint_state = self.obs
-            #
-            # # Image input only. Batch dim added; joint_state passed as None
-            # # since the model ignores it in this V1.
-            # image_t = torch.as_tensor(image).unsqueeze(0)   # (1, 3, 128, 128)
-            # features = self.model(image_t, None)            # (1, hidden_dim)
-            #
-            # # NOTE: model has no action head yet, so `features` is not a 7-dim
-            # # action. Until model.py adds an output layer, step a placeholder.
-            # action = np.concatenate((
-            #     np.random.uniform(-0.3, 0.3, 6), [np.random.choice([-1, 1])]
-            # ))
-            #
-            # self.obs, reward, done, info = self.env.step(action)  # action: 7-dim
-            #
-            # if done:
-            #     break
+    def test(self):
+        self.model.load_checkpoint()
+
+        image, joint_state = self.env.reset()
+
+        for i in range(3000):
+
+            action = self.model(image, joint_state)
+            obs, reward, done, info = self.env.step(action)
+            image, joint_state = obs.image.to(self.device), obs.joint_state.to(self.device)
+
+
+
+        
+
 
     def close(self):
         self.env.close()
