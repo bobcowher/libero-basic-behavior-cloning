@@ -1,6 +1,6 @@
 source ~/anaconda3/etc/profile.d/conda.sh
 
-conda activate libero
+conda activate libero-modern
 
 # Run once
 # python $(python -c "import robosuite, os; print(os.path.dirname(robosuite.__file__))")/scripts/setup_macros.py
