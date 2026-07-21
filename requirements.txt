@@ -21,6 +21,8 @@ torchvision
 
 # ---- LIBERO core stack (versions from LIBERO/requirements.txt) ----------------
 robosuite==1.4.0          # DO NOT bump to 1.5 — it removes SingleArmEnv, breaks LIBERO
+mujoco==2.3.2             # robosuite 1.4.0 declares mujoco>=2.3.0 (no upper bound);
+                          # mujoco 3.x changed mj_fullM() and breaks the OSC controller
 robomimic==0.2.0          # uses np.bool -> forces numpy<1.24 (see below)
 bddl==1.0.1
 gym==0.25.2
