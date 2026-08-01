@@ -39,13 +39,17 @@ fi
 # ---- 2. LIBERO source ----
 if [ ! -d "$LIBERO_DIR/.git" ]; then
   echo "[setup] cloning LIBERO -> $LIBERO_DIR"
-  git clone "$LIBERO_REPO" "$LIBERO_DIR"
+  # Shallow by default: Beekeeper kills the setup script at 300s
+  # (process_manager.py, timeout=300) and LIBERO's history carries every
+  # revision of its binary assets. Nothing here needs history. Set
+  # LIBERO_COMMIT to pin a revision -- the fetch below unshallows first.
+  git clone --depth 1 "$LIBERO_REPO" "$LIBERO_DIR"
 else
   echo "[setup] LIBERO already present at $LIBERO_DIR"
 fi
 if [ -n "$LIBERO_COMMIT" ]; then
   echo "[setup] checking out LIBERO@$LIBERO_COMMIT"
-  git -C "$LIBERO_DIR" fetch --all --quiet || true
+  git -C "$LIBERO_DIR" fetch --unshallow --quiet || git -C "$LIBERO_DIR" fetch --all --quiet || true
   git -C "$LIBERO_DIR" checkout "$LIBERO_COMMIT"
 fi
 
