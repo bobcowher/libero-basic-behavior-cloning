@@ -212,10 +212,14 @@ class Agent:
         return EvalResult(sum(successes) / len(successes), successes, steps_to_success)
 
     # ---- train -----------------------------------------------------------
-    def train(self, epochs, batch_size, eval_every=None, n_eval=20):
+    def train(self, steps, batch_size, eval_every=None, n_eval=20,
+              eval_max_steps=300):
         lowest_loss = float("inf")
 
-        for i in range(epochs):
+        # "steps", not epochs: get_batch samples with replacement, so there are
+        # no epoch boundaries. 100k steps at batch 32 is ~632 effective passes
+        # over the 5068-transition dataset.
+        for i in range(steps):
             batch = self.dl.get_batch(batch_size=batch_size)
 
             images = batch["agentview"].to(self.device)
@@ -236,5 +240,10 @@ class Agent:
                     self.model.save_checkpoint()
 
             # Same code path as standalone eval, so the two cannot drift.
+            # eval_max_steps is shorter than the standalone default: median
+            # success is ~108 steps, so 300 only truncates rollouts that were
+            # going to fail, and halves the cost of the early evals where
+            # nothing succeeds and every rollout runs to the cap.
             if eval_every and i > 0 and i % eval_every == 0:
-                print(f"step {i} {self.evaluate(n_eval=n_eval)}")
+                result = self.evaluate(n_eval=n_eval, max_steps=eval_max_steps)
+                print(f"step {i} {result}", flush=True)
