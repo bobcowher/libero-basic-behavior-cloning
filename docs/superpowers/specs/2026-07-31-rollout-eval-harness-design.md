@@ -23,9 +23,6 @@ fixes, adding tasks — is unmeasurable until this exists.
 - Failure diagnostics: video dumps, failure taxonomy bucketing
 - Pipeline correctness gates (demo replay round-trip, normalization audits)
 
-The design leaves a seam for the replay gate — a policy that emits recorded demo
-actions satisfies the same `BCPolicy` interface — but that gate is not built here.
-
 ## Protocol
 
 Replicated from LIBERO's own evaluation loop, `libero/lifelong/metric.py:102-161`.
@@ -65,27 +62,54 @@ out of scope here.
 
 ## Architecture
 
-Three new modules with one responsibility each, plus targeted edits to existing
-files.
+Evaluation lives on `Agent` as a method. `Agent` already owns the model, the
+device, and the task; evaluation needs exactly those. A separate evaluator module
+was considered and rejected as premature — there is one policy implementation and
+one caller, so the indirection would not have earned its existence yet.
 
-### `policy.py` — `BCPolicy`
+The consequences of that choice are handled explicitly below rather than left to
+discover later.
 
-Owns the model **and** observation preprocessing. Preprocessing must match
-training exactly; training is the policy's concern, so the two live together and
-train/eval skew has one place to hide instead of three.
+### `Agent.evaluate(n_eval=50, max_steps=600, env_num=1, seed=0) -> EvalResult`
+
+Builds envs, sets init states, runs the loop above, counts successes, closes
+envs, returns the result.
+
+Returns a three-field dataclass:
 
 ```python
-class BCPolicy:
-    def __init__(self, model, device): ...
-    def reset(self): ...                    # no-op; hook for ACT action chunking
-    def act(self, raw_obs) -> np.ndarray:   # (N, 7)
+@dataclass
+class EvalResult:
+    success_rate: float
+    successes: list[bool]              # per-rollout outcome
+    steps_to_success: list[int | None] # None on failure
 ```
 
-`raw_obs` is the vector-env output: an array of raw LIBERO observation dicts.
-`act` handles key translation, image conversion, batching, and the tensor
-round-trip.
+`n_eval` is `len(successes)`; wall time is the caller's business. A bare float
+would cover today's headline number, but the two lists cost one line each and are
+what any later failure analysis reads.
 
-Preprocessing, matching `env_wrapper.py` and the training loader:
+### Lazy construction
+
+`Agent.__init__` currently builds a DataLoader and an env eagerly. Both become
+lazy properties:
+
+- `Agent.dl` — built on first access. Scoring a checkpoint must not construct the
+  training dataset; at `hdf5_cache_mode="low_dim"` that is a multi-second load,
+  and at `"all"` it is gigabytes of RAM for data evaluation never reads.
+- `Agent.env` — built on first access. Training reads from the dataloader and
+  never steps an env, so training runs currently pay for a MuJoCo context they do
+  not use.
+
+This is the load-bearing part of keeping evaluation on `Agent`. Without it,
+`eval.py` builds the training set to run rollouts.
+
+### Observation preprocessing
+
+`Agent._preprocess_obs(raw_obs) -> (images, proprio)` is the **single** live-env
+preprocessing path. Per CONTEXT.md, HDF5-vs-live key mismatch is the top source
+of train/eval skew and it fails silently, so there must be exactly one
+implementation of this translation.
 
 - image: `agentview_image`, HWC uint8 `[0,255]` → CHW float32 `[0,1]`.
   **No vertical flip** — stored demos and the live env share the `opengl`
@@ -96,22 +120,12 @@ Preprocessing, matching `env_wrapper.py` and the training loader:
 If proprio normalization is ever introduced in training, it must be applied here
 with identical per-dimension statistics.
 
-`reset()` exists so action-chunking policies (the planned ACT baseline, which
-predicts 16 actions and executes 8) can clear their buffer between rollouts
-without changing the evaluator.
+Vector envs return an array of observation dicts, so this handles a batch and
+returns batched tensors.
 
-### `evaluate.py` — `evaluate(...) -> EvalResult`
+### Env construction
 
-```python
-def evaluate(policy, task_id=0, n_eval=50, max_steps=600,
-             env_num=1, seed=0) -> EvalResult
-```
-
-Owns envs, init states, the step loop, and success counting. Knows nothing about
-`Agent`, the dataloader, or optimizers. Any callable satisfying the `BCPolicy`
-interface can be evaluated.
-
-Environment construction mirrors `metric.py:70-94`:
+Mirrors `metric.py:70-94`:
 
 ```python
 env_args = {
@@ -124,68 +138,67 @@ env_args = {
 Paths are always built through `get_libero_path()`. The `env_args` recorded in
 the HDF5 file contain stale `chiliocosm/` paths and must be ignored.
 
-`EvalResult` is a dataclass:
-
-| Field | Type | Meaning |
-|---|---|---|
-| `success_rate` | `float` | `num_success / n_eval` |
-| `n_eval` | `int` | Rollouts run |
-| `successes` | `list[bool]` | Per-rollout outcome |
-| `steps_to_success` | `list[int \| None]` | Steps until `done`, `None` on failure |
-| `wall_time` | `float` | Seconds elapsed |
-
-The evaluator closes its envs before returning. Unclosed envs were the
-established cause of EGL shutdown tracebacks in this project.
-
-### `eval.py` — CLI
-
-```
-python eval.py --ckpt checkpoints/bc_network --n-eval 50
-```
-
-Loads the model, wraps it in `BCPolicy`, calls `evaluate`, prints a one-line
-summary. No dataloader is constructed, so running an evaluation does not build
-the multi-gigabyte dataset cache.
-
 ### Parallelism
 
-`DummyVectorEnv` at `env_num == 1`, which is what LIBERO's own evaluation uses
-in the single-env case. This is serial execution — no subprocesses, no
-fork-safety or EGL-in-worker debugging — while the batched interface comes from
-library code rather than hand-rolled code.
+`DummyVectorEnv` at `env_num == 1`, which is what LIBERO's own evaluation uses in
+the single-env case. This is serial execution — no subprocesses, no fork-safety
+or EGL-in-worker debugging — while the batched interface comes from library code
+rather than hand-rolled code.
 
 Moving to parallel evaluation later is a single constructor change to
-`SubprocVectorEnv`. No caller changes, because the interface is identical. Serial
-evaluation is the known bottleneck on the only metric that matters, so this swap
-is expected, but it happens after a known-good serial baseline exists to compare
-against.
+`SubprocVectorEnv`, with no caller changes because the interface is identical.
+Serial evaluation is the known bottleneck on the only metric that matters, so
+this swap is expected, but it happens after a known-good serial baseline exists
+to compare against.
+
+### `task_id` becomes a parameter
+
+`Agent.__init__` takes `task_id=0` and derives the dataset filename from
+`task_suite.get_task_demonstration(task_id)` rather than hardcoding both. This is
+not speculative generality: both values are already hardcoded constants at
+`agent.py:28` and `agent.py:33`, and deriving one from the other removes the
+possibility of an `Agent` whose dataset and env disagree about which task it is.
+
+Multi-task evaluation is out of scope. When it arrives, the shape of the problem
+is "one policy, N task ids," which does not fit an object whose identity is a
+single task — expect to revisit this choice then, deliberately, rather than
+discovering it mid-change.
 
 ## Changes to existing files
 
-**`agent.py`** — `test()` is deleted. `Agent` exposes `self.policy` (a
-`BCPolicy` wrapping its model) and `train()` gains an optional `eval_every`
-parameter that calls the same `evaluate()` function. The evaluation path and the
-training path therefore cannot drift.
+**`agent.py`** — gains `evaluate()`, `_preprocess_obs()`, lazy `dl` / `env`
+properties, and a `task_id` parameter. `test()` is deleted along with the
+`ControlEnv(has_renderer=True)` branch. `train()` gains an optional `eval_every`
+that calls `self.evaluate()`, so the training and evaluation paths cannot drift.
 
-**`test.py`** — deleted, along with the `ControlEnv(has_renderer=True)` branch in
-`Agent.__init__`. That path calls `env.render()` under `MUJOCO_GL=egl`, which
-cannot work: the viewer requires `glfw` and provides no camera observations.
-Watching a policy means writing MP4s of `agentview_image`, which mirrors real
-robot deployment. The viewer is a toy and is not worth a code path.
+**`test.py`** — deleted. Replaced by `eval.py`.
 
-**`env_wrapper.py`** — deleted. `LiberoObsWrapper` is superseded: preprocessing
-moves into `BCPolicy`, and vector envs return arrays of observation dicts rather
-than single dicts. Its only consumers were `Agent.__init__` (which wraps an env
-solely to print observation shapes) and the deleted `Agent.test()`. The training
-loop reads from the dataloader and never touches a live env. Removing it keeps
-preprocessing in exactly one place, which is the entire point of putting it in
-`BCPolicy`.
+**`eval.py`** — new, thin CLI:
 
-Consequently `Agent.__init__` stops constructing an env at all. Training does not
-need one, and building an env per `Agent` makes training startup pay for a
-MuJoCo context it never uses.
+```
+python eval.py --ckpt checkpoints/bc_network --task 0 --n-eval 50
+```
+
+Constructs an `Agent`, loads the checkpoint, calls `evaluate()`, prints a
+one-line summary.
+
+**`env_wrapper.py`** — deleted. `LiberoObsWrapper` is superseded by
+`Agent._preprocess_obs`, and vector envs return arrays of dicts rather than
+single dicts. Its only consumers were `Agent.__init__` (which wraps an env solely
+to print observation shapes) and the deleted `Agent.test()`. Keeping it would
+leave two live-obs preprocessing paths, which is precisely the skew this design
+is trying to prevent.
 
 **`build.sh`** — the run line points at `eval.py`.
+
+### On the deleted viewer path
+
+`Agent.test()` calls `env.render()` on a `ControlEnv(has_renderer=True)`. Under
+`MUJOCO_GL=egl` this cannot work: per CONTEXT.md the viewer requires `glfw` and
+provides no camera observations, so it cannot coexist with the offscreen
+rendering that produces policy inputs. Watching a policy means writing MP4s of
+`agentview_image`, which mirrors real robot deployment. The viewer is a toy and
+does not justify a code path.
 
 ## Error handling
 
@@ -193,32 +206,36 @@ MuJoCo context it never uses.
   five-second sleep, working around an intermittent frame-buffer issue. The same
   retry is reproduced; this failure is real and environment-specific.
 - **Env teardown** — envs are closed in a `finally` block. An exception mid-eval
-  must not leak an env and produce EGL tracebacks at interpreter shutdown.
+  must not leak an env and produce EGL tracebacks at interpreter shutdown, which
+  is the established cause of that symptom in this project.
 - **Checkpoint missing** — fail immediately with the attempted path, rather than
   evaluating a randomly initialized network and reporting 0%.
-- **Action shape or range** — assert the policy returns `(env_num, 7)` before the
-  first `env.step`. A silently wrong action shape is otherwise indistinguishable
-  from a bad policy.
+- **Action shape** — assert the policy returns `(env_num, 7)` before the first
+  `env.step`. A silently wrong action shape is otherwise indistinguishable from a
+  bad policy.
 
 ## Testing
 
 The harness is itself test infrastructure, so verification is behavioral rather
 than a large unit-test suite:
 
-1. **Zero-action policy** — a policy emitting all zeros must produce a 0% success
-   rate without crashing. Exercises the full loop, env lifecycle, and counting.
-2. **Shape assertions** — preprocessed image is `(N, 3, 128, 128)` float32 in
-   `[0, 1]`; proprio is `(N, 9)` float32.
-3. **Determinism** — two runs at the same seed with the same checkpoint produce
-   an identical success rate.
-4. **Known-checkpoint run** — evaluate the existing trained checkpoint. Any
+1. **Zero-action smoke run** — a few rollouts with an all-zeros action must
+   return 0% without crashing. Exercises the loop, env lifecycle, counting, and
+   preprocessing shapes in one pass, with no trained model required.
+2. **Lazy-construction check** — `evaluate()` runs without the DataLoader ever
+   being constructed. This is the property the lazy design exists to provide, so
+   it is asserted rather than assumed.
+3. **Known-checkpoint run** — evaluate the existing trained checkpoint. Any
    result is informative: it establishes the current baseline.
+
+Shape and determinism checks fold into (1) and (3) rather than standing alone;
+this is test infrastructure, not a library with external consumers.
 
 ## Success criteria
 
 `python eval.py --ckpt <path>` prints a success rate over 50 rollouts from
-benchmark init states, with no EGL tracebacks, and repeats identically at a fixed
-seed.
+benchmark init states, with no EGL tracebacks, without building the training
+dataset, and repeating identically at a fixed seed.
 
 ## Notes for later
 
@@ -226,5 +243,9 @@ seed.
   At 30%, the problem is the data pipeline or normalization, not architecture.
 - Failure taxonomy for this task, once diagnostics are built: (a) never reaches
   the bowl, (b) reaches but fumbles the grasp, (c) grasps but drops in transit.
-  `steps_to_success` and per-rollout outcomes are already carried by
-  `EvalResult`, which is the data those buckets would be derived from.
+  `successes` and `steps_to_success` on `EvalResult` are the raw material those
+  buckets derive from.
+- Action-chunking policies (the planned ACT baseline predicts 16 actions and
+  executes 8) need per-rollout state reset between episodes. Today's policy is
+  stateless, so no reset hook is built; adding one is a single call at the top of
+  each rollout.
