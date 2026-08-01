@@ -1,2 +1,6 @@
 pyrightconfig.json
 __pycache__
+.claude/
+CLAUDE.md
+checkpoints/
+*.mp4
