@@ -62,7 +62,37 @@ fi
 echo "[setup] editable-installing LIBERO (compat mode)"
 $PY -m pip install -e "$LIBERO_DIR" --config-settings editable_mode=compat
 
-# ---- 4. robosuite macros (best-effort, cosmetic) ----
+# ---- 4. LIBERO config.yaml (CRITICAL on a headless box) ----
+# libero/libero/__init__.py bootstraps ~/.libero/config.yaml on first import by
+# calling input() -- "Do you want to specify a custom path for the dataset
+# folder? (Y/N)". With no tty that raises EOFError and every entry point dies at
+# import. Write the same defaults it would have written, non-interactively.
+LIBERO_CONFIG_DIR="${LIBERO_CONFIG_PATH:-$HOME/.libero}"
+LIBERO_PKG="$LIBERO_DIR/libero/libero"
+if [ ! -f "$LIBERO_CONFIG_DIR/config.yaml" ]; then
+  echo "[setup] writing $LIBERO_CONFIG_DIR/config.yaml"
+  mkdir -p "$LIBERO_CONFIG_DIR"
+  cat > "$LIBERO_CONFIG_DIR/config.yaml" <<EOF
+assets: $LIBERO_PKG/assets
+bddl_files: $LIBERO_PKG/bddl_files
+benchmark_root: $LIBERO_PKG
+datasets: $LIBERO_DIR/libero/datasets
+init_states: $LIBERO_PKG/init_files
+EOF
+else
+  echo "[setup] LIBERO config.yaml already present"
+fi
+
+# ---- 5. demo datasets ----
+# The HDF5 demos are not in the LIBERO repo and not expressible in
+# requirements.txt. Fetch just the task we train on; see the script for why it
+# does not go through LIBERO's own downloader. huggingface_hub is installed here
+# rather than left to requirements.txt because this runs first.
+echo "[setup] fetching demo dataset"
+$PY -m pip install --quiet huggingface_hub pyyaml
+$PY "$(dirname "$0")/scripts/fetch_datasets.py"
+
+# ---- 6. robosuite macros (best-effort, cosmetic) ----
 # robosuite arrives with requirements.txt AFTER this script, so it's usually not
 # importable yet. Skip cleanly if so — robosuite runs fine without the private
 # macros file (it just prints a startup notice). If you want it applied, run the
