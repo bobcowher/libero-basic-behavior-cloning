@@ -2,6 +2,7 @@ import contextlib
 import io
 import multiprocessing as mp
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -231,11 +232,37 @@ class Agent:
         return EvalResult(sum(successes) / len(successes), successes, steps_to_success)
 
     # ---- train -----------------------------------------------------------
+    def _run_tag(self):
+        """Branch name for the run dir, matching the other projects' scheme.
+
+        Prefers the remote ref pointing at HEAD so a Beekeeper run (detached
+        after fetching) still names its branch; falls back to the local branch.
+        """
+        try:
+            refs = subprocess.check_output(
+                ["git", "for-each-ref", "--format=%(refname:short)",
+                 "--points-at", "HEAD", "refs/remotes/origin/"],
+                stderr=subprocess.DEVNULL).decode().strip()
+            tag = refs.splitlines()[0].replace("origin/", "") if refs else ""
+            if not tag:
+                tag = subprocess.check_output(
+                    ["git", "branch", "--show-current"],
+                    stderr=subprocess.DEVNULL).decode().strip()
+            return tag or "unknown"
+        except Exception:
+            return "unknown"
+
     def train(self, steps, batch_size, eval_every=None, n_eval=10,
-              eval_max_steps=300, eval_env_num=10, log_dir="runs"):
+              eval_max_steps=300, eval_env_num=10, log_dir="runs",
+              run_tag=None):
         # Timestamped run dir: TensorBoard's whole point is overlaying runs, so
-        # they must not overwrite each other.
-        run_dir = os.path.join(log_dir, time.strftime("%Y%m%d-%H%M%S"))
+        # they must not overwrite each other. Name matches the convention in
+        # sac-homebot-route-planner / q-homebot-route-planner so one
+        # `tensorboard --logdir` habit works across projects.
+        if run_tag is None:
+            run_tag = self._run_tag()
+        run_dir = os.path.join(
+            log_dir, f'{time.strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}')
         writer = SummaryWriter(run_dir)
         print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
               flush=True)
