@@ -1,5 +1,6 @@
 import contextlib
 import io
+import multiprocessing as mp
 import os
 import time
 from dataclasses import dataclass
@@ -16,7 +17,10 @@ from model import Model
 # so PYTHONWARNINGS can't filter it. Swallow stderr just for this import.
 with contextlib.redirect_stderr(io.StringIO()):
     from libero.libero import benchmark, get_libero_path
-    from libero.libero.envs import OffScreenRenderEnv, DummyVectorEnv
+    from libero.libero.envs import (OffScreenRenderEnv, DummyVectorEnv,
+                                    SubprocVectorEnv)
+
+from torch.utils.tensorboard import SummaryWriter
 
 IMG_SIZE = 128
 ACTION_DIM = 7
@@ -131,11 +135,26 @@ class Agent:
         env_args = {"bddl_file_name": bddl,
                     "camera_heights": IMG_SIZE, "camera_widths": IMG_SIZE}
 
+        cls = DummyVectorEnv if env_num == 1 else SubprocVectorEnv
+
+        if env_num > 1:
+            # MUST be spawn, not fork. The parent has already initialized CUDA
+            # (the model lives on GPU), and NVIDIA driver state does not
+            # survive fork() -- every forked worker dies with
+            # EGL_BAD_ALLOC in eglCreateContext. Spawn gives each worker a
+            # fresh interpreter that initializes its own EGL display.
+            #
+            # Viable because LIBERO wraps env fns in CloudpickleWrapper
+            # (venv.py:41), so the lambda below pickles. Requires every entry
+            # point to guard with `if __name__ == "__main__"`, or spawned
+            # children re-execute it.
+            mp.set_start_method("spawn", force=True)
+
         # LIBERO's own eval retries here: env creation intermittently fails on
         # a frame buffer error (lifelong/metric.py:85-100).
         for attempt in range(5):
             try:
-                env = DummyVectorEnv(
+                env = cls(
                     [lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)]
                 )
                 env.seed(seed)
@@ -212,8 +231,15 @@ class Agent:
         return EvalResult(sum(successes) / len(successes), successes, steps_to_success)
 
     # ---- train -----------------------------------------------------------
-    def train(self, steps, batch_size, eval_every=None, n_eval=20,
-              eval_max_steps=300):
+    def train(self, steps, batch_size, eval_every=None, n_eval=10,
+              eval_max_steps=300, eval_env_num=10, log_dir="runs"):
+        # Timestamped run dir: TensorBoard's whole point is overlaying runs, so
+        # they must not overwrite each other.
+        run_dir = os.path.join(log_dir, time.strftime("%Y%m%d-%H%M%S"))
+        writer = SummaryWriter(run_dir)
+        print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
+              flush=True)
+
         lowest_loss = float("inf")
 
         # "steps", not epochs: get_batch samples with replacement, so there are
@@ -235,6 +261,7 @@ class Agent:
 
             if i % 100 == 0:
                 print(f"step {i} loss {loss.item():.4f}")
+                writer.add_scalar("train/l1_loss", loss.item(), i)
                 if loss.item() < lowest_loss:
                     lowest_loss = loss.item()
                     self.model.save_checkpoint()
@@ -245,5 +272,22 @@ class Agent:
             # going to fail, and halves the cost of the early evals where
             # nothing succeeds and every rollout runs to the cap.
             if eval_every and i > 0 and i % eval_every == 0:
-                result = self.evaluate(n_eval=n_eval, max_steps=eval_max_steps)
-                print(f"step {i} {result}", flush=True)
+                self._log_eval(writer, i, n_eval, eval_max_steps, eval_env_num)
+
+        # range(steps) stops at steps-1, so the loop above never evaluates the
+        # final model. Score it explicitly rather than finishing untested.
+        if eval_every:
+            self._log_eval(writer, steps, n_eval, eval_max_steps, eval_env_num)
+
+        writer.close()
+
+    def _log_eval(self, writer, step, n_eval, max_steps, env_num):
+        result = self.evaluate(n_eval=n_eval, max_steps=max_steps,
+                               env_num=env_num)
+        print(f"step {step} {result}", flush=True)
+        writer.add_scalar("eval/success_rate", result.success_rate, step)
+        solved = [s for s in result.steps_to_success if s is not None]
+        if solved:
+            writer.add_scalar("eval/median_steps", float(np.median(solved)), step)
+        writer.flush()
+        return result
