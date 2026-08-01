@@ -1,127 +1,240 @@
 import contextlib
 import io
 import os
-import sys
+import time
+from dataclasses import dataclass
+
 import numpy as np
 import torch
-import h5py
-import inspect
+import torch.nn.functional as F
 
 from dataloader import DataLoader
-from env_wrapper import LiberoObsWrapper
 from model import Model
-import torch.nn as nn
-import torch.nn.functional as F
 
 # libero pulls in `gym`, which prints an unmaintained-package notice straight
 # to stderr on import (gym_notices) instead of raising a warnings.UserWarning,
 # so PYTHONWARNINGS can't filter it. Swallow stderr just for this import.
 with contextlib.redirect_stderr(io.StringIO()):
     from libero.libero import benchmark, get_libero_path
-    from libero.libero.envs import OffScreenRenderEnv
-    from libero.libero.envs.env_wrapper import ControlEnv
+    from libero.libero.envs import OffScreenRenderEnv, DummyVectorEnv
+
+IMG_SIZE = 128
+ACTION_DIM = 7
+
+# Steps of zero action after set_init_state, before the policy sees anything.
+# Copied from LIBERO's own eval loop (lifelong/metric.py). Without it the first
+# observation shows a mid-transient arm that matches no training frame.
+SETTLE_STEPS = 5
+
+
+@dataclass
+class EvalResult:
+    success_rate: float
+    successes: list          # per-rollout bool
+    steps_to_success: list   # step index of success, None on failure
+
+    def __str__(self):
+        solved = [s for s in self.steps_to_success if s is not None]
+        tail = f", median {int(np.median(solved))} steps" if solved else ""
+        return (f"success {self.success_rate:.1%} "
+                f"({sum(self.successes)}/{len(self.successes)}){tail}")
+
 
 class Agent:
 
-    def __init__(self, eval=False, lr=0.0001):
+    def __init__(self, task_id=0, lr=1e-4, device=None,
+                 ckpt="checkpoints/bc_network", benchmark_name="libero_spatial"):
+        self.task_id = task_id
+        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        dataset_filename = "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
-        self.dl = DataLoader(dataset_filename=dataset_filename)
+        self.task_suite = benchmark.get_benchmark_dict()[benchmark_name]()
+        self.task = self.task_suite.get_task(task_id)
 
-
-        task_suite = benchmark.get_benchmark_dict()["libero_spatial"]()
-        task = task_suite.get_task(0)
-        task_bddl = os.path.join(get_libero_path("bddl_files"),
-                                 task.problem_folder, task.bddl_file)
-        self.eval = eval
-
-        if self.eval:
-            self.env = ControlEnv(bddl_file_name=task_bddl, 
-                             has_renderer=True,
-                             has_offscreen_renderer=True, 
-                             use_camera_obs=True,
-                             render_camera="agentview")
-        else:
-            self.env = OffScreenRenderEnv(bddl_file_name=task_bddl,
-                                     camera_heights=128, camera_widths=128)
-        
-        self.env.seed(0)
-
-        # Wrap: raw obs dict -> (image (3,128,128) f32 [0,1], joint_state (9,) f32).
-        self.env = LiberoObsWrapper(self.env)
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-
-        # Image-input-only policy. input_shape is the wrapped image shape;
-        # joint_state is NOT fed in this V1 (model.forward ignores joint_state).
-        self.model = Model(input_shape=(3, 128, 128), num_actions=7, hidden_dim=256).to(self.device)
+        self.model = Model(
+            input_shape=(3, IMG_SIZE, IMG_SIZE),
+            num_actions=ACTION_DIM,
+            hidden_dim=256,
+            checkpoint_dir=os.path.dirname(ckpt) or ".",
+            name=os.path.basename(ckpt),
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
-        image, joint_state = self.env.reset()               # (image, joint_state)
-        print("image", image.shape, image.dtype, "joint_state", joint_state.shape)
-    
-    def train(self, epochs, batch_size):
+        self._dl = None
 
-        lowest_loss = 100 # Arbitrarily high number
+    # ---- lazy dataset ----------------------------------------------------
+    # Scoring a checkpoint must not construct the training set. Built on first
+    # access so eval-only runs never pay for it.
+    @property
+    def dl(self):
+        if self._dl is None:
+            # Derived from the task, so the dataset and the env can never
+            # disagree about which task this Agent is.
+            demo_path = self.task_suite.get_task_demonstration(self.task_id)
+            self._dl = DataLoader(dataset_filename=demo_path, device=self.device)
+        return self._dl
+
+    def load_checkpoint(self):
+        path = self.model.checkpoint_file
+        if not os.path.exists(path):
+            # Loud, not a 0% score from a randomly initialized network.
+            raise FileNotFoundError(f"no checkpoint at {path}")
+        self.model.load_checkpoint()
+
+    # ---- observation preprocessing ---------------------------------------
+    def _preprocess_obs(self, raw_obs):
+        """Array of live LIBERO obs dicts -> (images, proprio) device tensors.
+
+        The ONLY live-env preprocessing path. HDF5 and live envs use different
+        keys (agentview_rgb vs agentview_image, joint_states vs
+        robot0_joint_pos), which is the top source of silent train/eval skew --
+        so there is exactly one implementation of the translation.
+
+        No vertical flip: stored demos and the live env share the opengl
+        convention. Proprio is raw because the training loader delivers it raw;
+        if training ever normalizes it, normalize here with the SAME per-dim
+        stats.
+        """
+        images = np.stack([o["agentview_image"] for o in raw_obs])   # (N,H,W,3) uint8
+        images = images.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+
+        proprio = np.stack([
+            np.concatenate([o["robot0_joint_pos"], o["robot0_gripper_qpos"]])
+            for o in raw_obs
+        ]).astype(np.float32)                                        # (N, 9)
+
+        return (torch.from_numpy(images).to(self.device),
+                torch.from_numpy(proprio).to(self.device))
+
+    @torch.no_grad()
+    def _act(self, raw_obs):
+        images, proprio = self._preprocess_obs(raw_obs)
+        return self.model(images, proprio).cpu().numpy()
+
+    def _init_states(self):
+        """The benchmark's fixed eval init states.
+
+        Replicates benchmark.get_task_init_states (benchmark/__init__.py:158)
+        instead of calling it: that helper calls torch.load without
+        weights_only, and torch >= 2.6 defaults weights_only=True, which
+        rejects the numpy pickle. weights_only=False is safe here -- the file
+        is local benchmark data shipped with the LIBERO install, not a
+        downloaded checkpoint.
+        """
+        path = os.path.join(get_libero_path("init_states"),
+                            self.task.problem_folder, self.task.init_states_file)
+        return torch.load(path, weights_only=False)
+
+    # ---- env -------------------------------------------------------------
+    def _build_env(self, env_num, seed):
+        bddl = os.path.join(get_libero_path("bddl_files"),
+                            self.task.problem_folder, self.task.bddl_file)
+        env_args = {"bddl_file_name": bddl,
+                    "camera_heights": IMG_SIZE, "camera_widths": IMG_SIZE}
+
+        # LIBERO's own eval retries here: env creation intermittently fails on
+        # a frame buffer error (lifelong/metric.py:85-100).
+        for attempt in range(5):
+            try:
+                env = DummyVectorEnv(
+                    [lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)]
+                )
+                env.seed(seed)
+                return env
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(5)
+        raise RuntimeError("unreachable: env creation loop exhausted")
+
+    # ---- eval ------------------------------------------------------------
+    def evaluate(self, n_eval=50, max_steps=600, env_num=1, seed=0,
+                 zero_action=False):
+        """Rollout success rate from the benchmark's fixed init states.
+
+        Protocol mirrors LIBERO's lifelong/metric.py. zero_action ignores the
+        model and sends zeros -- a smoke test of the loop that needs no trained
+        checkpoint and must score 0%.
+        """
+        was_training = self.model.training
+        self.model.eval()
+
+        env = self._build_env(env_num, seed)
+        init_states = self._init_states()
+
+        successes, steps_to_success = [], []
+        eval_loop_num = (n_eval + env_num - 1) // env_num
+
+        try:
+            for i in range(eval_loop_num):
+                env.reset()
+                idx = np.arange(i * env_num, (i + 1) * env_num) % init_states.shape[0]
+                obs = env.set_init_state(init_states[idx])
+
+                for _ in range(SETTLE_STEPS):
+                    obs, _, _, _ = env.step(np.zeros((env_num, ACTION_DIM)))
+
+                dones = [False] * env_num
+                done_step = [None] * env_num
+
+                for step in range(1, max_steps + 1):
+                    if zero_action:
+                        actions = np.zeros((env_num, ACTION_DIM))
+                    else:
+                        actions = self._act(obs)
+                        assert actions.shape == (env_num, ACTION_DIM), (
+                            f"policy returned {actions.shape}, "
+                            f"expected {(env_num, ACTION_DIM)}"
+                        )
+
+                    obs, _, done, _ = env.step(actions)
+
+                    # Sticky: success means done fired at any point, not that
+                    # it was still set on the final step.
+                    for k in range(env_num):
+                        if not dones[k] and done[k]:
+                            dones[k], done_step[k] = True, step
+
+                    if all(dones):
+                        break
+
+                successes.extend(dones)
+                steps_to_success.extend(done_step)
+        finally:
+            # Unclosed envs are the established cause of EGL shutdown
+            # tracebacks in this project.
+            env.close()
+
+        if was_training:
+            self.model.train()
+
+        successes = successes[:n_eval]
+        steps_to_success = steps_to_success[:n_eval]
+        return EvalResult(sum(successes) / len(successes), successes, steps_to_success)
+
+    # ---- train -----------------------------------------------------------
+    def train(self, epochs, batch_size, eval_every=None, n_eval=20):
+        lowest_loss = float("inf")
 
         for i in range(epochs):
-
             batch = self.dl.get_batch(batch_size=batch_size)
 
-            images = batch['agentview'].to(self.device)
-            joint_states = batch['joint_state'].to(self.device)
-            actions = batch['actions'].to(self.device)
+            images = batch["agentview"].to(self.device)
+            joint_states = batch["joint_state"].to(self.device)
+            actions = batch["actions"].to(self.device)
 
-            # TODO: Go integrate joint states
             actions_pred = self.model(images, joint_states)
+            loss = F.l1_loss(actions_pred, actions)
 
-            loss = F.l1_loss(actions, actions_pred)
-            
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
             if i % 100 == 0:
-                print(f"Episode: {i} Loss: {loss.item()}")
-                
-                if(loss.item() < lowest_loss):
+                print(f"step {i} loss {loss.item():.4f}")
+                if loss.item() < lowest_loss:
                     lowest_loss = loss.item()
                     self.model.save_checkpoint()
-                    print(f"\nSaved checkpoint at episode {i}\n")
 
-    def test(self):
-        self.model.load_checkpoint()
-        self.model.eval()
-
-        # Wrapper returns numpy (3,128,128) image + (9,) joint_state.
-        image, joint_state = self.env.reset()
-
-        for i in range(3000):
-            with torch.no_grad():
-                # numpy -> batched GPU tensor for the model.
-                img_t = torch.as_tensor(image, device=self.device).unsqueeze(0)        # (1,3,128,128)
-                js_t = torch.as_tensor(joint_state, device=self.device).unsqueeze(0)   # (1,9)
-                action = self.model(img_t, js_t)                                       # (1,7)
-
-            # tensor -> numpy (7,) for robosuite's step().
-            action = action.squeeze(0).cpu().numpy()
-            (image, joint_state), reward, done, info = self.env.step(action)
-
-            self.env.render()
-
-            if done:
-                print(f"success at step {i}")
-                break
-
-
-
-
-        
-
-
-    def close(self):
-        self.env.close()
-
-        # print([k for k in obs.keys() if "image" in k])
-        #print(obs["agentview_image"].shape, obs["agentview_image"].mean())
-        # env.close()
-
+            # Same code path as standalone eval, so the two cannot drift.
+            if eval_every and i > 0 and i % eval_every == 0:
+                print(f"step {i} {self.evaluate(n_eval=n_eval)}")

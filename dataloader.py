@@ -27,9 +27,12 @@ class DataLoader():
         #   small seq_len. Host RAM only; never GPU.
         self.device = device
 
+        # dataset_filename is relative to the datasets root, including the
+        # problem folder: "libero_spatial/<task>_demo.hdf5". Agent derives it
+        # from task_suite.get_task_demonstration(task_id) rather than
+        # hardcoding a suite, so the dataset always matches the task's env.
         dataset_file = os.path.join(
             get_libero_path("datasets"),
-            "libero_spatial",
             dataset_filename
         )
 

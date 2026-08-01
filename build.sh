@@ -10,4 +10,4 @@ export ROBOSUITE_LOG_LEVEL=ERROR   # robosuite uses its own logger, not warnings
 #pip install -r requirements.txt
 
 # python -u ./train.py
-python -u ./test.py
+python -u ./eval.py "$@"
