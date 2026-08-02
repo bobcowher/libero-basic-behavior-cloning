@@ -31,12 +31,6 @@ torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 
-# What we configure the env's cameras to -- an input, not a derived value.
-IMG_SIZE = 128
-
-# Zero-action steps after set_init_state, from LIBERO's lifelong/metric.py.
-# Without them the first obs is a mid-transient arm matching no training frame.
-SETTLE_STEPS = 5
 
 
 class WatchEnv(ControlEnv):
@@ -88,6 +82,25 @@ class Agent:
         self.task_suite = benchmark.get_benchmark_dict()[benchmark_name]()
         self.task = self.task_suite.get_task(task_id)
 
+        # What we configure the env's cameras to -- an input, not a derived value.
+        self.img_size = 128
+
+        # Zero-action steps after set_init_state, from LIBERO's lifelong/metric.py.
+        # Without them the first obs is a mid-transient arm matching no training frame.
+        self.settle_steps = 5
+
+        # The camera the policy sees. Wrist-only: a real arm has no third-person
+        # view. The live env and the HDF5 loader name the same camera
+        # differently, so both keys live here -- swapping cameras must move
+        # train and eval together.
+        self.policy_cam_env = "robot0_eye_in_hand_image"   # live obs dict
+        self.policy_cam_batch = "wrist"                    # DataLoader.get_batch
+
+        # Third-person, for recorded video and the watch window only. Never fed
+        # to the policy.
+        self.human_cam_env = "agentview_image"
+
+        # Must follow the camera and size settings -- it builds an env.
         self.action_dim, self.proprio_dim, image_shape = self._probe_dims()
 
         self.model = Model(
@@ -124,8 +137,7 @@ class Agent:
 
             obs = env.reset()[0]
             proprio_dim = self._proprio(obs).shape[0]
-            print(obs)
-            h, w, c = obs["agentview_image"].shape     # -> (C,H,W) for the model
+            h, w, c = obs[self.policy_cam_env].shape        # -> (C,H,W) for the model
             return action_dim, proprio_dim, (c, h, w)
         finally:
             env.close()
@@ -151,7 +163,7 @@ class Agent:
         """Live LIBERO obs dicts -> (images, proprio) device tensors.
 
         The only live-env preprocessing path. HDF5 and live envs use different
-        keys for the same quantities (agentview_rgb vs agentview_image,
+        keys for the same quantities (eye_in_hand_rgb vs robot0_eye_in_hand_image,
         joint_states vs robot0_joint_pos) -- the top source of silent
         train/eval skew, so the translation exists once.
 
@@ -159,7 +171,7 @@ class Agent:
         Proprio is raw because the loader delivers it raw; if training ever
         normalizes, normalize here with the same stats.
         """
-        images = np.stack([o["agentview_image"] for o in raw_obs])   # (N,H,W,3) uint8
+        images = np.stack([o[self.policy_cam_env] for o in raw_obs])      # (N,H,W,3) uint8
         images = images.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
 
         proprio = np.stack([self._proprio(o) for o in raw_obs]
@@ -200,7 +212,7 @@ class Agent:
         bddl = os.path.join(get_libero_path("bddl_files"),
                             self.task.problem_folder, self.task.bddl_file)
         env_args = {"bddl_file_name": bddl,
-                    "camera_heights": IMG_SIZE, "camera_widths": IMG_SIZE}
+                    "camera_heights": self.img_size, "camera_widths": self.img_size}
 
         if render:
             assert env_num == 1, "render requires env_num=1"
@@ -319,7 +331,7 @@ class Agent:
         else:
             env.reset()
             obs = env.set_init_state(self._init_states()[np.array(batch)])
-            for _ in range(SETTLE_STEPS):
+            for _ in range(self.settle_steps):
                 obs, _, _, _ = env.step(np.zeros((n, self.action_dim)))
 
         if render:
@@ -327,7 +339,9 @@ class Agent:
 
         dones = [False] * n
         done_step = [None] * n
-        frames = [[o["agentview_image"]] for o in obs] if capture else None
+        # Third-person for the video even though the policy sees the wrist --
+        # a wrist recording can't show whether the task actually got solved.
+        frames = [[o[self.human_cam_env]] for o in obs] if capture else None
 
         for step in range(1, max_steps + 1):
             if zero_action:
@@ -346,7 +360,7 @@ class Agent:
 
             if frames is not None:
                 for k in range(n):
-                    frames[k].append(obs[k]["agentview_image"])
+                    frames[k].append(obs[k][self.human_cam_env])
 
             # Sticky: done fired at any point counts, not just on the last step.
             for k in range(n):
@@ -454,7 +468,7 @@ class Agent:
         for i in range(steps):
             batch = self.dl.get_batch(batch_size=batch_size)
 
-            images = batch["agentview"].to(self.device)
+            images = batch[self.policy_cam_batch].to(self.device)
             joint_states = batch["joint_state"].to(self.device)
             actions = batch["actions"].to(self.device)
 
