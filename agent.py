@@ -106,8 +106,8 @@ class Agent:
         # --- Architecture knobs (parametric sweep) -----------------------
         # Each experiment branch edits ONLY these three numbers. Baseline is
         # hidden_dim=256, compression_dim=256 (tied), n_hidden_layers=1.
-        self.hidden_dim = 256
-        self.compression_dim = 256
+        self.hidden_dim = 1024
+        self.compression_dim = 1024
         self.n_hidden_layers = 1
         # -----------------------------------------------------------------
 
