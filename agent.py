@@ -103,11 +103,21 @@ class Agent:
         # Must follow the camera and size settings -- it builds an env.
         self.action_dim, self.proprio_dim, image_shape = self._probe_dims()
 
+        # --- Architecture knobs (parametric sweep) -----------------------
+        # Each experiment branch edits ONLY these three numbers. Baseline is
+        # hidden_dim=256, compression_dim=256 (tied), n_hidden_layers=1.
+        self.hidden_dim = 256
+        self.compression_dim = 256
+        self.n_hidden_layers = 1
+        # -----------------------------------------------------------------
+
         self.model = Model(
             image_input_shape=image_shape,
             joint_input_dim=self.proprio_dim,
             num_actions=self.action_dim,
-            hidden_dim=256,
+            hidden_dim=self.hidden_dim,
+            compression_dim=self.compression_dim,
+            n_hidden_layers=self.n_hidden_layers,
             checkpoint_dir=os.path.dirname(ckpt) or ".",
             name=os.path.basename(ckpt),
         ).to(self.device)
@@ -457,9 +467,17 @@ class Agent:
         # matches sac-/q-homebot-route-planner.
         if run_tag is None:
             run_tag = self._run_tag()
+        # Encode the swept architecture in the run name so TensorBoard shows
+        # what was tested at a glance (e.g. ..._exp-hdim-128_h128_c128_L1).
+        arch = f"h{self.hidden_dim}_c{self.compression_dim}_L{self.n_hidden_layers}"
+        run_tag = f"{run_tag}_{arch}"
         run_dir = os.path.join(
             log_dir, f'{time.strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}')
         writer = SummaryWriter(run_dir)
+        writer.add_text(
+            "config/arch",
+            f"hidden_dim={self.hidden_dim}  compression_dim={self.compression_dim}"
+            f"  n_hidden_layers={self.n_hidden_layers}", 0)
         print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
               flush=True)
 

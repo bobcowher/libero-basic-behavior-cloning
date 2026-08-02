@@ -12,12 +12,15 @@ def weights_init_(m):
 
 
 class Model(nn.Module):
-    def __init__(self, image_input_shape, joint_input_dim, num_actions, hidden_dim, checkpoint_dir='checkpoints', name='bc_network'):
+    def __init__(self, image_input_shape, joint_input_dim, num_actions, hidden_dim,
+                 compression_dim=None, n_hidden_layers=1,
+                 checkpoint_dir='checkpoints', name='bc_network'):
         super(Model, self).__init__()
 
-        # compression_dim = int(hidden_dim / 2)
-
-        compression_dim = hidden_dim
+        # Per-modality embedding width before fusion. Defaults to hidden_dim
+        # (the historical behavior); pass a value to tune it independently.
+        if compression_dim is None:
+            compression_dim = hidden_dim
 
         self.conv1 = nn.Conv2d(image_input_shape[0], 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
@@ -28,15 +31,18 @@ class Model(nn.Module):
             flat_size = self._conv_forward(dummy).shape[1]
 
         self.joint_input = nn.Linear(joint_input_dim, compression_dim)
-        
+
         self.image_input = nn.Linear(flat_size, compression_dim)
 
         self.compression_layer = nn.Linear(compression_dim * 2, hidden_dim)
 
-        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        # n_hidden_layers hidden FC layers between fusion and output.
+        # n_hidden_layers=1 reproduces the original single `linear1`.
+        self.hidden_layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(n_hidden_layers)]
+        )
 
         self.output = nn.Linear(hidden_dim, num_actions)
-        # self.linear3 = nn.Linear(hidden_dim, hidden_dim)
 
         self.name = name
         self.checkpoint_dir = checkpoint_dir
@@ -63,8 +69,9 @@ class Model(nn.Module):
 
         x = F.relu(self.compression_layer(x))
 
-        x = F.relu(self.linear1(x))
-        x = F.tanh(self.output(x))
+        for layer in self.hidden_layers:
+            x = F.relu(layer(x))
+        x = torch.tanh(self.output(x))
         return x
     
     def save_checkpoint(self):
