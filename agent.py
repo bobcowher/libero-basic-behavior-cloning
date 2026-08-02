@@ -339,7 +339,7 @@ class Agent:
 
     def train(self, steps, batch_size, eval_every=None, n_eval=10,
               eval_max_steps=300, eval_env_num=10, log_dir="runs",
-              run_tag=None):
+              run_tag=None, save_every=10000):
         # Timestamped run dir: TensorBoard's whole point is overlaying runs, so
         # they must not overwrite each other. Name matches the convention in
         # sac-homebot-route-planner / q-homebot-route-planner so one
@@ -351,8 +351,6 @@ class Agent:
         writer = SummaryWriter(run_dir)
         print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
               flush=True)
-
-        lowest_loss = float("inf")
 
         # "steps", not epochs: get_batch samples with replacement, so there are
         # no epoch boundaries. 100k steps at batch 32 is ~632 effective passes
@@ -374,9 +372,15 @@ class Agent:
             if i % 100 == 0:
                 print(f"step {i} loss {loss.item():.4f}")
                 writer.add_scalar("train/l1_loss", loss.item(), i)
-                if loss.item() < lowest_loss:
-                    lowest_loss = loss.item()
-                    self.model.save_checkpoint()
+
+            # Periodic, unconditional save -- the checkpoint on disk is always
+            # the LATEST weights, not the lowest-loss ones. Run 427 measured why
+            # that matters: loss kept falling for 50k steps after success rate
+            # went flat, so best-loss selection was picking a model that scored
+            # worse than earlier ones it had already discarded.
+            if save_every and i > 0 and i % save_every == 0:
+                self.model.save_checkpoint()
+                print(f"step {i} saved {self.model.checkpoint_file}", flush=True)
 
             # Same code path as standalone eval, so the two cannot drift.
             # eval_max_steps is shorter than the standalone default: median
@@ -385,6 +389,11 @@ class Agent:
             # nothing succeeds and every rollout runs to the cap.
             if eval_every and i > 0 and i % eval_every == 0:
                 self._log_eval(writer, i, n_eval, eval_max_steps, eval_env_num)
+
+        # Save before the final eval, not after: eval builds envs and can fail,
+        # and losing the finished weights to a rendering error would be absurd.
+        self.model.save_checkpoint()
+        print(f"step {steps} saved {self.model.checkpoint_file}", flush=True)
 
         # range(steps) stops at steps-1, so the loop above never evaluates the
         # final model. Score it explicitly rather than finishing untested.

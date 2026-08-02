@@ -14,8 +14,12 @@ def main():
     #   n_eval=10, env_num=10 -> exactly one parallel batch, so an eval costs
     #     about as long as a single rollout. Scores scenes 0-9 of the 50
     #     available; `eval.py --n-eval 50` is the full-test-set number.
+    #   save_every=10000 overwrites the checkpoint unconditionally, so the file
+    #     on disk is always the latest weights. Best-loss selection is gone --
+    #     run 427 showed it keeps a model that scores worse than ones it threw
+    #     away, because loss keeps falling long after success rate flattens.
     agent.train(steps=100000, batch_size=32, eval_every=10000,
-                n_eval=10, eval_env_num=10)
+                n_eval=10, eval_env_num=10, save_every=10000)
 
 
 if __name__ == "__main__":
