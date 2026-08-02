@@ -108,7 +108,7 @@ class Agent:
         # hidden_dim=256, compression_dim=256 (tied), n_hidden_layers=1.
         self.hidden_dim = 256
         self.compression_dim = 256
-        self.n_hidden_layers = 1
+        self.n_hidden_layers = 2
         # -----------------------------------------------------------------
 
         self.model = Model(
