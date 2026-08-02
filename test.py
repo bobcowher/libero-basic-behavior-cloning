@@ -29,9 +29,10 @@ def main():
     p.add_argument("--ckpt", default=None,
                    help="default: newest file in checkpoints/")
     p.add_argument("--task", type=int, default=0)
-    p.add_argument("--scene", type=int, default=0,
-                   help="which of the 50 benchmark init states to start from")
-    p.add_argument("--max-steps", type=int, default=1000)
+    p.add_argument("--scene", type=int, default=None,
+                   help="benchmark init state to start from; omit to use the "
+                        "reference project's seed-0 double-reset scene")
+    p.add_argument("--max-steps", type=int, default=900)
     args = p.parse_args()
 
     ckpt = args.ckpt or latest_ckpt()

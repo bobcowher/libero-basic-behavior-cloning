@@ -168,7 +168,7 @@ class Agent:
         raise RuntimeError("unreachable: env creation loop exhausted")
 
     # ---- watch ------------------------------------------------------------
-    def test(self, scene=0, max_steps=1000):
+    def test(self, scene=None, max_steps=900):
         """Run the policy in a live viewer window.
 
         Both renderers on at once: has_renderer draws the window,
@@ -178,10 +178,19 @@ class Agent:
         Needs MUJOCO_GL=glfw and a display -- test.py sets that before this
         module is imported, since mujoco picks its backend at import time.
 
-        Starts from the same benchmark init state eval scores (`scene` indexes
-        the 50), and takes the same settle steps, so what you watch is a
-        rollout eval.py would have counted. Actions come from self._act, the
-        one preprocessing path.
+        scene=None reproduces the reference project's protocol exactly: seed 0
+        and **two** env.reset() calls, no settle steps. The reset COUNT is what
+        picks the scene -- each reset advances the BDDL sampler, and the
+        reference happens to reset twice (once in its Agent.__init__, once in
+        its test()). One reset lands on a scene the policy does not solve; two
+        lands on one it does. Same seed, same scene, every run.
+
+        scene=N instead starts from benchmark init state N with the settle
+        steps evaluate() uses, for watching a specific scored scene.
+
+        max_steps stays under robosuite's horizon of 1000: stepping past it
+        raises ValueError("executing action in terminated episode"), which is
+        how the reference crashes on a rollout that fails.
         """
         self.model.eval()
 
@@ -196,10 +205,14 @@ class Agent:
         env.seed(0)
 
         try:
-            env.reset()
-            obs = env.set_init_state(self._init_states()[scene])
-            for _ in range(SETTLE_STEPS):
-                obs, _, _, _ = env.step(np.zeros(ACTION_DIM))
+            if scene is None:
+                env.reset()
+                obs = env.reset()
+            else:
+                env.reset()
+                obs = env.set_init_state(self._init_states()[scene])
+                for _ in range(SETTLE_STEPS):
+                    obs, _, _, _ = env.step(np.zeros(ACTION_DIM))
 
             for step in range(1, max_steps + 1):
                 obs, _, done, _ = env.step(self._act([obs])[0])
