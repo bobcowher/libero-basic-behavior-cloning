@@ -12,19 +12,26 @@ def weights_init_(m):
 
 
 class Model(nn.Module):
-    def __init__(self, input_shape, num_actions, hidden_dim, checkpoint_dir='checkpoints', name='bc_network'):
+    def __init__(self, image_input_shape, joint_input_dim, num_actions, hidden_dim, checkpoint_dir='checkpoints', name='bc_network'):
         super(Model, self).__init__()
 
-        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4)
+        compression_dim = hidden_dim / 2
+
+        self.conv1 = nn.Conv2d(image_input_shape[0], 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
         with torch.no_grad():
-            dummy = torch.zeros(1, *input_shape)
+            dummy = torch.zeros(1, *image_input_shape)
             flat_size = self._conv_forward(dummy).shape[1]
+
+        self.joint_input = nn.Linear(joint_input_dim, compression_dim)
         
-        self.linear1 = nn.Linear(flat_size, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.image_input = nn.Linear(flat_size, compression_dim)
+
+        self.compression_layer = nn.Linear(compression_dim * 2, hidden_dim)
+
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
 
         self.output = nn.Linear(hidden_dim, num_actions)
         # self.linear3 = nn.Linear(hidden_dim, hidden_dim)
@@ -45,10 +52,16 @@ class Model(nn.Module):
         return x.flatten(1)
 
     def forward(self, obs, joint_state):
-        x = self._conv_forward(obs)
+        x_image = self._conv_forward(obs)
+        x_image = self.relu(self.image_input(x_image))
+
+        x_joint = self.relu(self.joint_input(joint_state))
+
+        x = torch.cat([x_image, x_joint])
+
+        x = self.relu(self.compression_layer(x))
 
         x = F.relu(self.linear1(x))
-        x = F.relu(self.linear2(x))
         x = F.tanh(self.output(x))
         return x
     
