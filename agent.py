@@ -20,6 +20,7 @@ with contextlib.redirect_stderr(io.StringIO()):
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import (OffScreenRenderEnv, DummyVectorEnv,
                                     SubprocVectorEnv)
+    from libero.libero.envs.env_wrapper import ControlEnv
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -165,6 +166,53 @@ class Agent:
                     raise
                 time.sleep(5)
         raise RuntimeError("unreachable: env creation loop exhausted")
+
+    # ---- watch ------------------------------------------------------------
+    def test(self, scene=0, max_steps=1000):
+        """Run the policy in a live viewer window.
+
+        Both renderers on at once: has_renderer draws the window,
+        has_offscreen_renderer + use_camera_obs give the policy its agentview
+        images. Watching and acting are not mutually exclusive.
+
+        Needs MUJOCO_GL=glfw and a display -- test.py sets that before this
+        module is imported, since mujoco picks its backend at import time.
+
+        Starts from the same benchmark init state eval scores (`scene` indexes
+        the 50), and takes the same settle steps, so what you watch is a
+        rollout eval.py would have counted. Actions come from self._act, the
+        one preprocessing path.
+        """
+        self.model.eval()
+
+        bddl = os.path.join(get_libero_path("bddl_files"),
+                            self.task.problem_folder, self.task.bddl_file)
+        env = ControlEnv(bddl_file_name=bddl,
+                         has_renderer=True,
+                         has_offscreen_renderer=True,
+                         use_camera_obs=True,
+                         render_camera="agentview",
+                         camera_heights=IMG_SIZE, camera_widths=IMG_SIZE)
+        env.seed(0)
+
+        try:
+            env.reset()
+            obs = env.set_init_state(self._init_states()[scene])
+            for _ in range(SETTLE_STEPS):
+                obs, _, _, _ = env.step(np.zeros(ACTION_DIM))
+
+            for step in range(1, max_steps + 1):
+                obs, _, done, _ = env.step(self._act([obs])[0])
+                # ControlEnv has no render(); the window belongs to the
+                # robosuite env it wraps. LiberoObsWrapper did the same.
+                env.env.render()
+                if done:
+                    print(f"success at step {step}")
+                    return True
+            print(f"no success in {max_steps} steps")
+            return False
+        finally:
+            env.close()
 
     def _write_video(self, path, frames, fps=20):
         """MP4 of exactly what the policy saw.
