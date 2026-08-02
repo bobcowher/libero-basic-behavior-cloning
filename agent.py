@@ -24,6 +24,19 @@ with contextlib.redirect_stderr(io.StringIO()):
 
 from torch.utils.tensorboard import SummaryWriter
 
+# Rollout outcomes are chaotic in the low-order bits: a tiny action difference
+# compounds over hundreds of closed-loop steps into success vs failure. cuDNN
+# TF32 is ON by default on Ampere+ and makes conv output depend on BATCH SIZE,
+# so evaluate(env_num=10) and evaluate(env_num=1) scored different scenes with
+# identical weights. Measured on this model: max action delta between batch-1
+# and batch-10 is 1.64e-4 with TF32, 1.49e-8 without.
+#
+# Set at import, before any model is built, so every entry point gets it.
+# Costs little here -- the net is tiny and training is not GPU-bound.
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+
 IMG_SIZE = 128
 ACTION_DIM = 7
 
@@ -113,8 +126,23 @@ class Agent:
 
     @torch.no_grad()
     def _act(self, raw_obs):
+        """Actions for a list of live obs dicts.
+
+        Evaluated ONE observation at a time even when several envs are in
+        flight. Batched conv reductions are batch-size dependent -- ~1e-4 with
+        cuDNN TF32, ~1e-8 without -- and closed-loop rollouts amplify either
+        into a different success/failure outcome. That made evaluate() report
+        different solved scenes at env_num=1 and env_num=10.
+
+        A policy is a pure function of one observation; batching it is an
+        optimization that must not change the answer. Costs nothing that
+        matters here: the MuJoCo step dominates wall clock, not this net.
+        """
         images, proprio = self._preprocess_obs(raw_obs)
-        return self.model(images, proprio).cpu().numpy()
+        return np.stack([
+            self.model(images[i:i + 1], proprio[i:i + 1])[0].cpu().numpy()
+            for i in range(images.shape[0])
+        ])
 
     def _init_states(self):
         """The benchmark's fixed eval init states.
@@ -159,7 +187,13 @@ class Agent:
                 env = cls(
                     [lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)]
                 )
-                env.seed(seed)
+                # A LIST, not an int. BaseVectorEnv.seed(int) expands to
+                # [seed + i for i in range(env_num)] (venv.py:849), so worker k
+                # runs under seed k -- and a scene's rollout then depends on
+                # which worker happened to draw it, i.e. on env_num. Passing a
+                # list is taken verbatim (venv.py:851), so every worker is
+                # identical and a scene scores the same at any env_num.
+                env.seed([seed] * env_num)
                 return env
             except Exception:
                 if attempt == 4:
@@ -257,18 +291,28 @@ class Agent:
         record_dir writes one MP4 per rollout, named by outcome. Recording is a
         parameter here rather than a separate script so that watching a rollout
         and scoring one cannot drift apart -- there is one rollout loop.
+
+        A FRESH env is built for every batch and closed after it, so no rollout
+        inherits simulator state from another. reset() + set_init_state() is
+        NOT sufficient: the 92-dim state vector is time+qpos+qvel and does not
+        carry MuJoCo's qacc_warmstart, so the contact solver warm-starts from
+        whatever ran before. Measured on one checkpoint over scenes 0-19:
+        reusing an env scored {4, 17}, a fresh env per rollout scored {6}, and
+        the whole-run rate moved 5% -> 10% -> 15% purely with env reuse and
+        env_num. Rebuilding costs env construction per batch; a score that
+        depends on evaluation order costs more.
         """
         was_training = self.model.training
         self.model.eval()
 
-        env = self._build_env(env_num, seed)
         init_states = self._init_states()
 
         successes, steps_to_success = [], []
         eval_loop_num = (n_eval + env_num - 1) // env_num
 
-        try:
-            for i in range(eval_loop_num):
+        for i in range(eval_loop_num):
+            env = self._build_env(env_num, seed)
+            try:
                 env.reset()
                 idx = np.arange(i * env_num, (i + 1) * env_num) % init_states.shape[0]
                 obs = env.set_init_state(init_states[idx])
@@ -317,10 +361,10 @@ class Agent:
 
                 successes.extend(dones)
                 steps_to_success.extend(done_step)
-        finally:
-            # Unclosed envs are the established cause of EGL shutdown
-            # tracebacks in this project.
-            env.close()
+            finally:
+                # Unclosed envs are the established cause of EGL shutdown
+                # tracebacks in this project.
+                env.close()
 
         if was_training:
             self.model.train()
