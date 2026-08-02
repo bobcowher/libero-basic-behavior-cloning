@@ -63,6 +63,11 @@ def main():
         zero_action=args.zero_action,
     )
     print(result)
+    # Which scenes, not just how many. A single scene replayed looks like a
+    # working policy; this names the ones that actually work, so you can watch
+    # them with `test.py --scene N`.
+    solved = [i for i, s in enumerate(result.successes) if s]
+    print(f"solved scenes: {solved}")
 
 
 if __name__ == "__main__":
