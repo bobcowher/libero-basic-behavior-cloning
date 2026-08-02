@@ -166,14 +166,36 @@ class Agent:
                 time.sleep(5)
         raise RuntimeError("unreachable: env creation loop exhausted")
 
+    def _write_video(self, path, frames, fps=20):
+        """MP4 of exactly what the policy saw.
+
+        Orientation follows LIBERO's own renderer
+        (benchmark_scripts/render_single_task.py:33): vertical flip, then
+        RGB->BGR for cv2. The frames are the raw agentview obs, so a video that
+        looks wrong here means the model's input looks wrong too.
+        """
+        import cv2
+        h, w = frames[0].shape[:2]
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (w, h))
+        try:
+            for f in frames:
+                writer.write(f[::-1, :, ::-1])
+        finally:
+            writer.release()
+
     # ---- eval ------------------------------------------------------------
     def evaluate(self, n_eval=50, max_steps=600, env_num=1, seed=0,
-                 zero_action=False):
+                 zero_action=False, record_dir=None):
         """Rollout success rate from the benchmark's fixed init states.
 
         Protocol mirrors LIBERO's lifelong/metric.py. zero_action ignores the
         model and sends zeros -- a smoke test of the loop that needs no trained
         checkpoint and must score 0%.
+
+        record_dir writes one MP4 per rollout, named by outcome. Recording is a
+        parameter here rather than a separate script so that watching a rollout
+        and scoring one cannot drift apart -- there is one rollout loop.
         """
         was_training = self.model.training
         self.model.eval()
@@ -195,6 +217,7 @@ class Agent:
 
                 dones = [False] * env_num
                 done_step = [None] * env_num
+                frames = [[o["agentview_image"]] for o in obs] if record_dir else None
 
                 for step in range(1, max_steps + 1):
                     if zero_action:
@@ -208,6 +231,10 @@ class Agent:
 
                     obs, _, done, _ = env.step(actions)
 
+                    if frames is not None:
+                        for k in range(env_num):
+                            frames[k].append(obs[k]["agentview_image"])
+
                     # Sticky: success means done fired at any point, not that
                     # it was still set on the final step.
                     for k in range(env_num):
@@ -216,6 +243,16 @@ class Agent:
 
                     if all(dones):
                         break
+
+                if frames is not None:
+                    os.makedirs(record_dir, exist_ok=True)
+                    for k in range(env_num):
+                        tag = "success" if dones[k] else "fail"
+                        path = os.path.join(
+                            record_dir, f"rollout{i * env_num + k:02d}_{tag}.mp4")
+                        self._write_video(path, frames[k])
+                        print(f"  wrote {path} ({len(frames[k])} frames)",
+                              flush=True)
 
                 successes.extend(dones)
                 steps_to_success.extend(done_step)

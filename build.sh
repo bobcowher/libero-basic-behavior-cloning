@@ -9,5 +9,6 @@ export ROBOSUITE_LOG_LEVEL=ERROR   # robosuite uses its own logger, not warnings
 
 #pip install -r requirements.txt
 
-# python -u ./train.py
-python -u ./eval.py "$@"
+# The main script: training. Score a checkpoint with ./eval.py, watch one run
+# with ./test.py -- both take the same conda env this sets up.
+python -u ./train.py "$@"
