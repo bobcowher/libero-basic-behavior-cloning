@@ -30,6 +30,24 @@ def latest_ckpt():
     return os.path.join(CKPT_DIR, "bc_network")
 
 
+def parse_scenes(spec):
+    """"0,10,20" or "0-9" or a mix -> [0, 10, 20] / [0..9].
+
+    Shared with test.py so the two entry points name scenes identically. That
+    is what makes `eval.py --scenes 0,10,20` the direct check on what
+    `test.py --scenes 0,10,20` just showed you.
+    """
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-")
+            out.extend(range(int(lo), int(hi) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default=None,
@@ -37,6 +55,9 @@ def main():
     p.add_argument("--task", type=int, default=0)
     p.add_argument("--n-eval", type=int, default=50,
                    help="rollouts; fewer than 20 is noise")
+    p.add_argument("--scenes", default=None,
+                   help='init states to score, e.g. "0-9" or "0,10,20"; '
+                        "overrides --n-eval")
     p.add_argument("--max-steps", type=int, default=600)
     p.add_argument("--env-num", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
@@ -57,6 +78,7 @@ def main():
 
     result = agent.evaluate(
         n_eval=args.n_eval,
+        scenes=parse_scenes(args.scenes) if args.scenes else None,
         max_steps=args.max_steps,
         env_num=args.env_num,
         seed=args.seed,
@@ -65,9 +87,8 @@ def main():
     print(result)
     # Which scenes, not just how many. A single scene replayed looks like a
     # working policy; this names the ones that actually work, so you can watch
-    # them with `test.py --scene N`.
-    solved = [i for i, s in enumerate(result.successes) if s]
-    print(f"solved scenes: {solved}")
+    # them with `test.py --scenes N`.
+    print(f"solved scenes: {result.solved}")
 
 
 if __name__ == "__main__":

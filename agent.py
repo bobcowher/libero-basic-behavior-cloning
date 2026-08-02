@@ -46,11 +46,45 @@ ACTION_DIM = 7
 SETTLE_STEPS = 5
 
 
+class WatchEnv(ControlEnv):
+    """OffScreenRenderEnv plus an on-screen window.
+
+    Deliberately a copy of OffScreenRenderEnv (env_wrapper.py:152) with
+    has_renderer flipped, because that class hardcodes it to False. Watching
+    and scoring must differ by exactly this one boolean and nothing else --
+    same class, same kwargs, same physics -- so a rollout you watch is the
+    rollout eval.py scores.
+
+    Offscreen rendering stays ON: it produces the agentview_image the policy
+    consumes. The window is an extra view, not the policy's input.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs["has_renderer"] = True
+        kwargs["has_offscreen_renderer"] = True
+        super().__init__(**kwargs)
+
+    def render(self, **kwargs):
+        # ControlEnv defines no render(); the window belongs to the robosuite
+        # env it wraps. The vector env calls worker.render() -> env.render(),
+        # so this forward is what lets the shared rollout loop drive the view.
+        return self.env.render(**kwargs)
+
+
 @dataclass
 class EvalResult:
-    success_rate: float
+    scenes: list             # benchmark init-state index per rollout
     successes: list          # per-rollout bool
     steps_to_success: list   # step index of success, None on failure
+
+    @property
+    def success_rate(self):
+        return sum(self.successes) / len(self.successes)
+
+    @property
+    def solved(self):
+        """Scene indices that succeeded -- which ones, not just how many."""
+        return [s for s, ok in zip(self.scenes, self.successes) if ok]
 
     def __str__(self):
         solved = [s for s in self.steps_to_success if s is not None]
@@ -159,11 +193,23 @@ class Agent:
         return torch.load(path, weights_only=False)
 
     # ---- env -------------------------------------------------------------
-    def _build_env(self, env_num, seed):
+    def _build_env(self, env_num, seed, render=False):
         bddl = os.path.join(get_libero_path("bddl_files"),
                             self.task.problem_folder, self.task.bddl_file)
         env_args = {"bddl_file_name": bddl,
                     "camera_heights": IMG_SIZE, "camera_widths": IMG_SIZE}
+
+        if render:
+            # A window per worker is unwatchable, and the on-screen renderer is
+            # not process-safe under spawn.
+            assert env_num == 1, "render requires env_num=1"
+            # The viewer camera only. It does not touch camera_names, so the
+            # policy's agentview_image is unaffected -- you are watching the
+            # same frames the net is fed.
+            env_args["render_camera"] = "agentview"
+            make = lambda: WatchEnv(**env_args)          # noqa: E731
+        else:
+            make = lambda: OffScreenRenderEnv(**env_args)  # noqa: E731
 
         cls = DummyVectorEnv if env_num == 1 else SubprocVectorEnv
 
@@ -184,9 +230,7 @@ class Agent:
         # a frame buffer error (lifelong/metric.py:85-100).
         for attempt in range(5):
             try:
-                env = cls(
-                    [lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)]
-                )
+                env = cls([make for _ in range(env_num)])
                 # A LIST, not an int. BaseVectorEnv.seed(int) expands to
                 # [seed + i for i in range(env_num)] (venv.py:849), so worker k
                 # runs under seed k -- and a scene's rollout then depends on
@@ -202,64 +246,66 @@ class Agent:
         raise RuntimeError("unreachable: env creation loop exhausted")
 
     # ---- watch ------------------------------------------------------------
-    def test(self, scene=None, max_steps=900):
-        """Run the policy in a live viewer window.
+    # Scenes watched by default: a stride across the whole 50-scene set rather
+    # than the first N. Scenes 0-4 are a corner of the set; 0,10,20,30,40
+    # samples all of it, so what you watch is representative of what eval.py
+    # scores.
+    WATCH_SCENES = list(range(0, 50, 10))
 
-        Both renderers on at once: has_renderer draws the window,
-        has_offscreen_renderer + use_camera_obs give the policy its agentview
-        images. Watching and acting are not mutually exclusive.
+    def test(self, scenes=None, max_steps=300, reference_protocol=False):
+        """Watch the policy run, in a window, on the scenes eval.py scores.
+
+        This is a VIEW of the eval, not a separate thing: every rollout goes
+        through evaluate(), so a scene shown succeeding here is a scene counted
+        succeeding there. test() and evaluate() previously kept their own
+        rollout loops and disagreed about the same checkpoint -- there is now
+        one loop, and the only difference between watching and scoring is the
+        has_renderer boolean in WatchEnv.
 
         Needs MUJOCO_GL=glfw and a display -- test.py sets that before this
         module is imported, since mujoco picks its backend at import time.
 
-        scene=None reproduces the reference project's protocol exactly: seed 0
-        and **two** env.reset() calls, no settle steps. The reset COUNT is what
-        picks the scene -- each reset advances the BDDL sampler, and the
-        reference happens to reset twice (once in its Agent.__init__, once in
-        its test()). One reset lands on a scene the policy does not solve; two
-        lands on one it does. Same seed, same scene, every run.
+        Runs one scene per evaluate() call so outcomes print as they happen
+        instead of after the last rollout. Each rollout still gets a fresh env
+        (see evaluate), which means the window is torn down and reopened
+        between scenes -- correctness over a persistent window.
 
-        scene=N instead starts from benchmark init state N with the settle
-        steps evaluate() uses, for watching a specific scored scene.
+        max_steps defaults to 300, well under the 600 eval.py uses: successful
+        rollouts finish near the demos' ~101 steps, so nothing real is
+        truncated, and a failure stops wasting your time sooner. Rendering
+        makes failures the expensive ones.
 
-        max_steps stays under robosuite's horizon of 1000: stepping past it
-        raises ValueError("executing action in terminated episode"), which is
-        how the reference crashes on a rollout that fails.
+        reference_protocol=True instead reproduces the reference project's odd
+        setup once: seed 0, **two** env.reset() calls, no init state, no settle
+        steps. Kept because it is the known-good comparison, but it is NOT a
+        scored scene -- reset() samples fresh placements, a third distribution
+        that appears in neither the demos nor the 50 eval states. Not the
+        default for exactly that reason.
         """
-        self.model.eval()
+        if reference_protocol:
+            r = self.evaluate(scenes=[None], max_steps=max_steps, render=True)
+            print("reference protocol (unscored scene): "
+                  f"{'ok' if r.successes[0] else 'FAIL'}")
+            return r
 
-        bddl = os.path.join(get_libero_path("bddl_files"),
-                            self.task.problem_folder, self.task.bddl_file)
-        env = ControlEnv(bddl_file_name=bddl,
-                         has_renderer=True,
-                         has_offscreen_renderer=True,
-                         use_camera_obs=True,
-                         render_camera="agentview",
-                         camera_heights=IMG_SIZE, camera_widths=IMG_SIZE)
-        env.seed(0)
+        scenes = self.WATCH_SCENES if scenes is None else list(scenes)
 
-        try:
-            if scene is None:
-                env.reset()
-                obs = env.reset()
-            else:
-                env.reset()
-                obs = env.set_init_state(self._init_states()[scene])
-                for _ in range(SETTLE_STEPS):
-                    obs, _, _, _ = env.step(np.zeros(ACTION_DIM))
+        successes, steps = [], []
+        for scene in scenes:
+            r = self.evaluate(scenes=[scene], max_steps=max_steps, render=True)
+            ok, step = r.successes[0], r.steps_to_success[0]
+            print(f"scene {scene:>2}  {'ok  ' if ok else 'FAIL'}  "
+                  f"({step if step is not None else max_steps} steps)",
+                  flush=True)
+            successes.append(ok)
+            steps.append(step)
 
-            for step in range(1, max_steps + 1):
-                obs, _, done, _ = env.step(self._act([obs])[0])
-                # ControlEnv has no render(); the window belongs to the
-                # robosuite env it wraps. LiberoObsWrapper did the same.
-                env.env.render()
-                if done:
-                    print(f"success at step {step}")
-                    return True
-            print(f"no success in {max_steps} steps")
-            return False
-        finally:
-            env.close()
+        # Printed as a count, never a percentage. At a true rate near 0.18, a
+        # 5-scene sample comes up empty ~37% of the time; this is a liveness
+        # read, and eval.py at n_eval=50 is the measurement. A percentage here
+        # would invite quoting it as one.
+        print(f"{sum(successes)}/{len(successes)}")
+        return EvalResult(scenes, successes, steps)
 
     def _write_video(self, path, frames, fps=20):
         """MP4 of exactly what the policy saw.
@@ -280,17 +326,85 @@ class Agent:
             writer.release()
 
     # ---- eval ------------------------------------------------------------
+    def _rollout(self, env, batch, max_steps, render=False, zero_action=False,
+                 capture=False):
+        """One batch of rollouts on a fresh env. THE rollout loop.
+
+        Every rollout in this project runs here -- scored, watched, recorded.
+        Anything that needs a variation takes a flag rather than a second copy
+        of the loop, because the two copies that used to exist drifted and
+        disagreed about the same checkpoint.
+
+        batch is a list of benchmark init-state indices, one per env. A batch
+        of [None] means the reference protocol: two resets and no init state,
+        letting the BDDL sampler pick.
+
+        Returns (dones, done_step, frames).
+        """
+        n = len(batch)
+
+        # Protocol from LIBERO's lifelong/metric.py: reset, set state, settle.
+        if batch == [None]:
+            env.reset()
+            obs = env.reset()
+        else:
+            env.reset()
+            obs = env.set_init_state(self._init_states()[np.array(batch)])
+            for _ in range(SETTLE_STEPS):
+                obs, _, _, _ = env.step(np.zeros((n, ACTION_DIM)))
+
+        if render:
+            env.render()
+
+        dones = [False] * n
+        done_step = [None] * n
+        frames = [[o["agentview_image"]] for o in obs] if capture else None
+
+        for step in range(1, max_steps + 1):
+            if zero_action:
+                actions = np.zeros((n, ACTION_DIM))
+            else:
+                actions = self._act(obs)
+                assert actions.shape == (n, ACTION_DIM), (
+                    f"policy returned {actions.shape}, expected {(n, ACTION_DIM)}"
+                )
+
+            obs, _, done, _ = env.step(actions)
+
+            if render:
+                env.render()
+
+            if frames is not None:
+                for k in range(n):
+                    frames[k].append(obs[k]["agentview_image"])
+
+            # Sticky: success means done fired at any point, not that it was
+            # still set on the final step.
+            for k in range(n):
+                if not dones[k] and done[k]:
+                    dones[k], done_step[k] = True, step
+
+            if all(dones):
+                break
+
+        return dones, done_step, frames
+
     def evaluate(self, n_eval=50, max_steps=600, env_num=1, seed=0,
-                 zero_action=False, record_dir=None):
+                 zero_action=False, record_dir=None, scenes=None, render=False):
         """Rollout success rate from the benchmark's fixed init states.
 
-        Protocol mirrors LIBERO's lifelong/metric.py. zero_action ignores the
-        model and sends zeros -- a smoke test of the loop that needs no trained
-        checkpoint and must score 0%.
+        scenes names the init states to run; n_eval is shorthand for the first
+        n. Naming them explicitly is what lets test.py watch exactly the scenes
+        eval.py scores, and lets both report per-scene outcomes that can be
+        compared directly.
 
-        record_dir writes one MP4 per rollout, named by outcome. Recording is a
-        parameter here rather than a separate script so that watching a rollout
-        and scoring one cannot drift apart -- there is one rollout loop.
+        zero_action ignores the model and sends zeros -- a smoke test of the
+        loop that needs no trained checkpoint and must score 0%.
+
+        record_dir writes one MP4 per rollout, named by outcome. render opens a
+        live window instead (env_num=1 only). Both are parameters here rather
+        than separate scripts so that watching, recording and scoring cannot
+        drift apart -- see _rollout.
 
         A FRESH env is built for every batch and closed after it, so no rollout
         inherits simulator state from another. reset() + set_init_state() is
@@ -305,56 +419,31 @@ class Agent:
         was_training = self.model.training
         self.model.eval()
 
-        init_states = self._init_states()
+        if scenes is None:
+            scenes = [i % self._init_states().shape[0] for i in range(n_eval)]
+        else:
+            scenes = list(scenes)
 
         successes, steps_to_success = [], []
-        eval_loop_num = (n_eval + env_num - 1) // env_num
 
-        for i in range(eval_loop_num):
-            env = self._build_env(env_num, seed)
+        for i in range(0, len(scenes), env_num):
+            batch = scenes[i:i + env_num]
+            # Sized to the batch, so a short final batch is not padded with
+            # throwaway rollouts. Safe only because a rollout's outcome no
+            # longer depends on how many envs share the step.
+            env = self._build_env(len(batch), seed, render=render)
             try:
-                env.reset()
-                idx = np.arange(i * env_num, (i + 1) * env_num) % init_states.shape[0]
-                obs = env.set_init_state(init_states[idx])
-
-                for _ in range(SETTLE_STEPS):
-                    obs, _, _, _ = env.step(np.zeros((env_num, ACTION_DIM)))
-
-                dones = [False] * env_num
-                done_step = [None] * env_num
-                frames = [[o["agentview_image"]] for o in obs] if record_dir else None
-
-                for step in range(1, max_steps + 1):
-                    if zero_action:
-                        actions = np.zeros((env_num, ACTION_DIM))
-                    else:
-                        actions = self._act(obs)
-                        assert actions.shape == (env_num, ACTION_DIM), (
-                            f"policy returned {actions.shape}, "
-                            f"expected {(env_num, ACTION_DIM)}"
-                        )
-
-                    obs, _, done, _ = env.step(actions)
-
-                    if frames is not None:
-                        for k in range(env_num):
-                            frames[k].append(obs[k]["agentview_image"])
-
-                    # Sticky: success means done fired at any point, not that
-                    # it was still set on the final step.
-                    for k in range(env_num):
-                        if not dones[k] and done[k]:
-                            dones[k], done_step[k] = True, step
-
-                    if all(dones):
-                        break
+                dones, done_step, frames = self._rollout(
+                    env, batch, max_steps, render=render,
+                    zero_action=zero_action, capture=record_dir is not None)
 
                 if frames is not None:
                     os.makedirs(record_dir, exist_ok=True)
-                    for k in range(env_num):
+                    for k, scene in enumerate(batch):
                         tag = "success" if dones[k] else "fail"
+                        name = "ref" if scene is None else f"{scene:02d}"
                         path = os.path.join(
-                            record_dir, f"rollout{i * env_num + k:02d}_{tag}.mp4")
+                            record_dir, f"scene{name}_{tag}.mp4")
                         self._write_video(path, frames[k])
                         print(f"  wrote {path} ({len(frames[k])} frames)",
                               flush=True)
@@ -369,9 +458,7 @@ class Agent:
         if was_training:
             self.model.train()
 
-        successes = successes[:n_eval]
-        steps_to_success = steps_to_success[:n_eval]
-        return EvalResult(sum(successes) / len(successes), successes, steps_to_success)
+        return EvalResult(scenes, successes, steps_to_success)
 
     # ---- train -----------------------------------------------------------
     def _run_tag(self):
