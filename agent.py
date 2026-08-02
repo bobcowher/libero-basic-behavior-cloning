@@ -24,39 +24,27 @@ with contextlib.redirect_stderr(io.StringIO()):
 
 from torch.utils.tensorboard import SummaryWriter
 
-# Rollout outcomes are chaotic in the low-order bits: a tiny action difference
-# compounds over hundreds of closed-loop steps into success vs failure. cuDNN
-# TF32 is ON by default on Ampere+ and makes conv output depend on BATCH SIZE,
-# so evaluate(env_num=10) and evaluate(env_num=1) scored different scenes with
-# identical weights. Measured on this model: max action delta between batch-1
-# and batch-10 is 1.64e-4 with TF32, 1.49e-8 without.
-#
-# Set at import, before any model is built, so every entry point gets it.
-# Costs little here -- the net is tiny and training is not GPU-bound.
+# cuDNN TF32 is on by default on Ampere+ and makes conv output batch-size
+# dependent: max action delta batch-1 vs batch-10 is 1.64e-4 with it, 1.49e-8
+# without. Closed-loop rollouts amplify that into different solved scenes.
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 
+# What we configure the env's cameras to -- an input, not a derived value.
 IMG_SIZE = 128
-ACTION_DIM = 7
 
-# Steps of zero action after set_init_state, before the policy sees anything.
-# Copied from LIBERO's own eval loop (lifelong/metric.py). Without it the first
-# observation shows a mid-transient arm that matches no training frame.
+# Zero-action steps after set_init_state, from LIBERO's lifelong/metric.py.
+# Without them the first obs is a mid-transient arm matching no training frame.
 SETTLE_STEPS = 5
 
 
 class WatchEnv(ControlEnv):
-    """OffScreenRenderEnv plus an on-screen window.
+    """OffScreenRenderEnv with the on-screen window enabled.
 
-    Deliberately a copy of OffScreenRenderEnv (env_wrapper.py:152) with
-    has_renderer flipped, because that class hardcodes it to False. Watching
-    and scoring must differ by exactly this one boolean and nothing else --
-    same class, same kwargs, same physics -- so a rollout you watch is the
-    rollout eval.py scores.
-
-    Offscreen rendering stays ON: it produces the agentview_image the policy
-    consumes. The window is an extra view, not the policy's input.
+    A separate class only because OffScreenRenderEnv hardcodes
+    has_renderer=False (env_wrapper.py:152). Watching and scoring must differ
+    by this boolean and nothing else.
     """
 
     def __init__(self, **kwargs):
@@ -65,9 +53,7 @@ class WatchEnv(ControlEnv):
         super().__init__(**kwargs)
 
     def render(self, **kwargs):
-        # ControlEnv defines no render(); the window belongs to the robosuite
-        # env it wraps. The vector env calls worker.render() -> env.render(),
-        # so this forward is what lets the shared rollout loop drive the view.
+        # ControlEnv defines no render(); the window belongs to the wrapped env.
         return self.env.render(**kwargs)
 
 
@@ -83,7 +69,6 @@ class EvalResult:
 
     @property
     def solved(self):
-        """Scene indices that succeeded -- which ones, not just how many."""
         return [s for s, ok in zip(self.scenes, self.successes) if ok]
 
     def __str__(self):
@@ -103,9 +88,12 @@ class Agent:
         self.task_suite = benchmark.get_benchmark_dict()[benchmark_name]()
         self.task = self.task_suite.get_task(task_id)
 
+        self.action_dim, self.proprio_dim, image_shape = self._probe_dims()
+
         self.model = Model(
-            input_shape=(3, IMG_SIZE, IMG_SIZE),
-            num_actions=ACTION_DIM,
+            image_input_shape=image_shape,
+            joint_input_dim=self.proprio_dim,
+            num_actions=self.action_dim,
             hidden_dim=256,
             checkpoint_dir=os.path.dirname(ckpt) or ".",
             name=os.path.basename(ckpt),
@@ -114,14 +102,38 @@ class Agent:
 
         self._dl = None
 
+    # ---- shapes ----------------------------------------------------------
+    @staticmethod
+    def _proprio(obs):
+        """The proprio vector. Used to size the model AND to feed it, so the
+        two cannot drift."""
+        return np.concatenate([obs["robot0_joint_pos"], obs["robot0_gripper_qpos"]])
+
+    def _probe_dims(self):
+        """(action_dim, proprio_dim, image_shape) from a throwaway env, ~2.8s.
+
+        Safe to reset: the BDDL placement sampler is per-instance, so this does
+        not shift the scenes a later env samples (verified, distance exactly 0).
+        """
+        env = self._build_env(1, seed=0)
+        try:
+            # NOT robots[0].dof -- that counts the gripper as 1 actuated DOF
+            # while the obs reports 2 finger positions.
+            robot = env.get_env_attr("robots")[0][0]   # worker 0, arm 0
+            action_dim = robot.action_dim
+
+            obs = env.reset()[0]
+            proprio_dim = self._proprio(obs).shape[0]
+            h, w, c = obs["agentview_image"].shape     # -> (C,H,W) for the model
+            return action_dim, proprio_dim, (c, h, w)
+        finally:
+            env.close()
+
     # ---- lazy dataset ----------------------------------------------------
-    # Scoring a checkpoint must not construct the training set. Built on first
-    # access so eval-only runs never pay for it.
+    # Lazy so scoring a checkpoint never builds the training set.
     @property
     def dl(self):
         if self._dl is None:
-            # Derived from the task, so the dataset and the env can never
-            # disagree about which task this Agent is.
             demo_path = self.task_suite.get_task_demonstration(self.task_id)
             self._dl = DataLoader(dataset_filename=demo_path, device=self.device)
         return self._dl
@@ -135,25 +147,22 @@ class Agent:
 
     # ---- observation preprocessing ---------------------------------------
     def _preprocess_obs(self, raw_obs):
-        """Array of live LIBERO obs dicts -> (images, proprio) device tensors.
+        """Live LIBERO obs dicts -> (images, proprio) device tensors.
 
-        The ONLY live-env preprocessing path. HDF5 and live envs use different
-        keys (agentview_rgb vs agentview_image, joint_states vs
-        robot0_joint_pos), which is the top source of silent train/eval skew --
-        so there is exactly one implementation of the translation.
+        The only live-env preprocessing path. HDF5 and live envs use different
+        keys for the same quantities (agentview_rgb vs agentview_image,
+        joint_states vs robot0_joint_pos) -- the top source of silent
+        train/eval skew, so the translation exists once.
 
-        No vertical flip: stored demos and the live env share the opengl
-        convention. Proprio is raw because the training loader delivers it raw;
-        if training ever normalizes it, normalize here with the SAME per-dim
-        stats.
+        No vertical flip: demos and the live env share the opengl convention.
+        Proprio is raw because the loader delivers it raw; if training ever
+        normalizes, normalize here with the same stats.
         """
         images = np.stack([o["agentview_image"] for o in raw_obs])   # (N,H,W,3) uint8
         images = images.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
 
-        proprio = np.stack([
-            np.concatenate([o["robot0_joint_pos"], o["robot0_gripper_qpos"]])
-            for o in raw_obs
-        ]).astype(np.float32)                                        # (N, 9)
+        proprio = np.stack([self._proprio(o) for o in raw_obs]
+                           ).astype(np.float32)                      # (N, 9)
 
         return (torch.from_numpy(images).to(self.device),
                 torch.from_numpy(proprio).to(self.device))
@@ -162,15 +171,10 @@ class Agent:
     def _act(self, raw_obs):
         """Actions for a list of live obs dicts.
 
-        Evaluated ONE observation at a time even when several envs are in
-        flight. Batched conv reductions are batch-size dependent -- ~1e-4 with
-        cuDNN TF32, ~1e-8 without -- and closed-loop rollouts amplify either
-        into a different success/failure outcome. That made evaluate() report
-        different solved scenes at env_num=1 and env_num=10.
-
-        A policy is a pure function of one observation; batching it is an
-        optimization that must not change the answer. Costs nothing that
-        matters here: the MuJoCo step dominates wall clock, not this net.
+        One observation at a time, even with several envs in flight: batched
+        conv reductions are batch-size dependent (~1e-8 even without TF32), and
+        that was enough to change which scenes evaluate() solved. The MuJoCo
+        step dominates wall clock, so this costs nothing that matters.
         """
         images, proprio = self._preprocess_obs(raw_obs)
         return np.stack([
@@ -179,14 +183,12 @@ class Agent:
         ])
 
     def _init_states(self):
-        """The benchmark's fixed eval init states.
+        """The benchmark's 50 fixed eval init states.
 
         Replicates benchmark.get_task_init_states (benchmark/__init__.py:158)
-        instead of calling it: that helper calls torch.load without
-        weights_only, and torch >= 2.6 defaults weights_only=True, which
-        rejects the numpy pickle. weights_only=False is safe here -- the file
-        is local benchmark data shipped with the LIBERO install, not a
-        downloaded checkpoint.
+        rather than calling it: that helper omits weights_only, which torch
+        >= 2.6 defaults to True, rejecting the numpy pickle. Safe here -- local
+        benchmark data, not a downloaded checkpoint.
         """
         path = os.path.join(get_libero_path("init_states"),
                             self.task.problem_folder, self.task.init_states_file)
@@ -200,12 +202,9 @@ class Agent:
                     "camera_heights": IMG_SIZE, "camera_widths": IMG_SIZE}
 
         if render:
-            # A window per worker is unwatchable, and the on-screen renderer is
-            # not process-safe under spawn.
             assert env_num == 1, "render requires env_num=1"
-            # The viewer camera only. It does not touch camera_names, so the
-            # policy's agentview_image is unaffected -- you are watching the
-            # same frames the net is fed.
+            # Viewer camera only -- does not touch camera_names, so the policy's
+            # agentview_image is unaffected.
             env_args["render_camera"] = "agentview"
             make = lambda: WatchEnv(**env_args)          # noqa: E731
         else:
@@ -214,29 +213,18 @@ class Agent:
         cls = DummyVectorEnv if env_num == 1 else SubprocVectorEnv
 
         if env_num > 1:
-            # MUST be spawn, not fork. The parent has already initialized CUDA
-            # (the model lives on GPU), and NVIDIA driver state does not
-            # survive fork() -- every forked worker dies with
-            # EGL_BAD_ALLOC in eglCreateContext. Spawn gives each worker a
-            # fresh interpreter that initializes its own EGL display.
-            #
-            # Viable because LIBERO wraps env fns in CloudpickleWrapper
-            # (venv.py:41), so the lambda below pickles. Requires every entry
-            # point to guard with `if __name__ == "__main__"`, or spawned
-            # children re-execute it.
+            # Spawn, not fork: CUDA is already initialized in the parent and
+            # driver state does not survive fork() -- forked workers die with
+            # EGL_BAD_ALLOC. Requires entry points to guard __main__.
             mp.set_start_method("spawn", force=True)
 
-        # LIBERO's own eval retries here: env creation intermittently fails on
-        # a frame buffer error (lifelong/metric.py:85-100).
+        # Env creation intermittently fails on a frame buffer error; LIBERO's
+        # own eval retries too (lifelong/metric.py:85-100).
         for attempt in range(5):
             try:
                 env = cls([make for _ in range(env_num)])
-                # A LIST, not an int. BaseVectorEnv.seed(int) expands to
-                # [seed + i for i in range(env_num)] (venv.py:849), so worker k
-                # runs under seed k -- and a scene's rollout then depends on
-                # which worker happened to draw it, i.e. on env_num. Passing a
-                # list is taken verbatim (venv.py:851), so every worker is
-                # identical and a scene scores the same at any env_num.
+                # A list, not an int: seed(int) expands to seed+i per worker
+                # (venv.py:849), making a scene's result depend on env_num.
                 env.seed([seed] * env_num)
                 return env
             except Exception:
@@ -246,41 +234,28 @@ class Agent:
         raise RuntimeError("unreachable: env creation loop exhausted")
 
     # ---- watch ------------------------------------------------------------
-    # Scenes watched by default: a stride across the whole 50-scene set rather
-    # than the first N. Scenes 0-4 are a corner of the set; 0,10,20,30,40
-    # samples all of it, so what you watch is representative of what eval.py
-    # scores.
+    # A stride across the whole 50-scene set; the first N would be a corner of
+    # it.
     WATCH_SCENES = list(range(0, 50, 10))
 
     def test(self, scenes=None, max_steps=300, reference_protocol=False):
         """Watch the policy run, in a window, on the scenes eval.py scores.
 
-        This is a VIEW of the eval, not a separate thing: every rollout goes
-        through evaluate(), so a scene shown succeeding here is a scene counted
-        succeeding there. test() and evaluate() previously kept their own
-        rollout loops and disagreed about the same checkpoint -- there is now
-        one loop, and the only difference between watching and scoring is the
-        has_renderer boolean in WatchEnv.
+        A view of the eval, not a separate thing -- every rollout goes through
+        evaluate(), so a scene seen succeeding here is one counted there.
 
-        Needs MUJOCO_GL=glfw and a display -- test.py sets that before this
-        module is imported, since mujoco picks its backend at import time.
+        Needs MUJOCO_GL=glfw and a display; test.py sets that before importing
+        this module, since mujoco picks its backend at import.
 
-        Runs one scene per evaluate() call so outcomes print as they happen
-        instead of after the last rollout. Each rollout still gets a fresh env
-        (see evaluate), which means the window is torn down and reopened
-        between scenes -- correctness over a persistent window.
+        One scene per evaluate() call so outcomes print as they happen. Each
+        rollout still gets a fresh env, so the window reopens between scenes.
 
-        max_steps defaults to 300, well under the 600 eval.py uses: successful
-        rollouts finish near the demos' ~101 steps, so nothing real is
-        truncated, and a failure stops wasting your time sooner. Rendering
-        makes failures the expensive ones.
+        max_steps=300 vs eval.py's 600: successes finish near ~101 steps, so
+        only doomed rollouts are truncated.
 
-        reference_protocol=True instead reproduces the reference project's odd
-        setup once: seed 0, **two** env.reset() calls, no init state, no settle
-        steps. Kept because it is the known-good comparison, but it is NOT a
-        scored scene -- reset() samples fresh placements, a third distribution
-        that appears in neither the demos nor the 50 eval states. Not the
-        default for exactly that reason.
+        reference_protocol reproduces the reference project's setup (seed 0,
+        two resets, no init state, no settle). NOT a scored scene -- reset()
+        samples fresh placements, a third distribution.
         """
         if reference_protocol:
             r = self.evaluate(scenes=[None], max_steps=max_steps, render=True)
@@ -300,20 +275,17 @@ class Agent:
             successes.append(ok)
             steps.append(step)
 
-        # Printed as a count, never a percentage. At a true rate near 0.18, a
-        # 5-scene sample comes up empty ~37% of the time; this is a liveness
-        # read, and eval.py at n_eval=50 is the measurement. A percentage here
-        # would invite quoting it as one.
+        # A count, never a percentage: at a true rate near 0.18 a 5-scene sample
+        # is empty ~37% of the time. This is a liveness read, eval.py measures.
         print(f"{sum(successes)}/{len(successes)}")
         return EvalResult(scenes, successes, steps)
 
     def _write_video(self, path, frames, fps=20):
-        """MP4 of exactly what the policy saw.
+        """MP4 of exactly what the policy saw -- a video that looks wrong means
+        the model's input is wrong.
 
-        Orientation follows LIBERO's own renderer
-        (benchmark_scripts/render_single_task.py:33): vertical flip, then
-        RGB->BGR for cv2. The frames are the raw agentview obs, so a video that
-        looks wrong here means the model's input looks wrong too.
+        Vertical flip then RGB->BGR, following LIBERO's own renderer
+        (benchmark_scripts/render_single_task.py:33).
         """
         import cv2
         h, w = frames[0].shape[:2]
@@ -330,16 +302,12 @@ class Agent:
                  capture=False):
         """One batch of rollouts on a fresh env. THE rollout loop.
 
-        Every rollout in this project runs here -- scored, watched, recorded.
-        Anything that needs a variation takes a flag rather than a second copy
-        of the loop, because the two copies that used to exist drifted and
+        Every rollout runs here -- scored, watched, recorded. Variations are
+        flags, not copies; the two copies that used to exist drifted and
         disagreed about the same checkpoint.
 
-        batch is a list of benchmark init-state indices, one per env. A batch
-        of [None] means the reference protocol: two resets and no init state,
-        letting the BDDL sampler pick.
-
-        Returns (dones, done_step, frames).
+        batch is a list of init-state indices, one per env; [None] means the
+        reference protocol. Returns (dones, done_step, frames).
         """
         n = len(batch)
 
@@ -351,7 +319,7 @@ class Agent:
             env.reset()
             obs = env.set_init_state(self._init_states()[np.array(batch)])
             for _ in range(SETTLE_STEPS):
-                obs, _, _, _ = env.step(np.zeros((n, ACTION_DIM)))
+                obs, _, _, _ = env.step(np.zeros((n, self.action_dim)))
 
         if render:
             env.render()
@@ -362,11 +330,12 @@ class Agent:
 
         for step in range(1, max_steps + 1):
             if zero_action:
-                actions = np.zeros((n, ACTION_DIM))
+                actions = np.zeros((n, self.action_dim))
             else:
                 actions = self._act(obs)
-                assert actions.shape == (n, ACTION_DIM), (
-                    f"policy returned {actions.shape}, expected {(n, ACTION_DIM)}"
+                assert actions.shape == (n, self.action_dim), (
+                    f"policy returned {actions.shape}, "
+                    f"expected {(n, self.action_dim)}"
                 )
 
             obs, _, done, _ = env.step(actions)
@@ -378,8 +347,7 @@ class Agent:
                 for k in range(n):
                     frames[k].append(obs[k]["agentview_image"])
 
-            # Sticky: success means done fired at any point, not that it was
-            # still set on the final step.
+            # Sticky: done fired at any point counts, not just on the last step.
             for k in range(n):
                 if not dones[k] and done[k]:
                     dones[k], done_step[k] = True, step
@@ -394,27 +362,15 @@ class Agent:
         """Rollout success rate from the benchmark's fixed init states.
 
         scenes names the init states to run; n_eval is shorthand for the first
-        n. Naming them explicitly is what lets test.py watch exactly the scenes
-        eval.py scores, and lets both report per-scene outcomes that can be
-        compared directly.
+        n. zero_action sends zeros instead of model output -- a smoke test that
+        must score 0%. record_dir writes one MP4 per rollout; render opens a
+        live window (env_num=1 only).
 
-        zero_action ignores the model and sends zeros -- a smoke test of the
-        loop that needs no trained checkpoint and must score 0%.
-
-        record_dir writes one MP4 per rollout, named by outcome. render opens a
-        live window instead (env_num=1 only). Both are parameters here rather
-        than separate scripts so that watching, recording and scoring cannot
-        drift apart -- see _rollout.
-
-        A FRESH env is built for every batch and closed after it, so no rollout
-        inherits simulator state from another. reset() + set_init_state() is
-        NOT sufficient: the 92-dim state vector is time+qpos+qvel and does not
-        carry MuJoCo's qacc_warmstart, so the contact solver warm-starts from
-        whatever ran before. Measured on one checkpoint over scenes 0-19:
-        reusing an env scored {4, 17}, a fresh env per rollout scored {6}, and
-        the whole-run rate moved 5% -> 10% -> 15% purely with env reuse and
-        env_num. Rebuilding costs env construction per batch; a score that
-        depends on evaluation order costs more.
+        A fresh env per batch, closed after: reset() + set_init_state() is NOT
+        a clean slate, because the 92-dim state is time+qpos+qvel and omits
+        qacc_warmstart, so the contact solver warm-starts from the previous
+        rollout. Measured over scenes 0-19: a reused env solved {4,17}, a fresh
+        one solved {6}.
         """
         was_training = self.model.training
         self.model.eval()
@@ -428,9 +384,8 @@ class Agent:
 
         for i in range(0, len(scenes), env_num):
             batch = scenes[i:i + env_num]
-            # Sized to the batch, so a short final batch is not padded with
-            # throwaway rollouts. Safe only because a rollout's outcome no
-            # longer depends on how many envs share the step.
+            # Sized to the batch so a short final one is not padded. Safe only
+            # because outcomes no longer depend on how many envs share a step.
             env = self._build_env(len(batch), seed, render=render)
             try:
                 dones, done_step, frames = self._rollout(
@@ -451,8 +406,7 @@ class Agent:
                 successes.extend(dones)
                 steps_to_success.extend(done_step)
             finally:
-                # Unclosed envs are the established cause of EGL shutdown
-                # tracebacks in this project.
+                # Unclosed envs cause EGL shutdown tracebacks.
                 env.close()
 
         if was_training:
@@ -462,10 +416,10 @@ class Agent:
 
     # ---- train -----------------------------------------------------------
     def _run_tag(self):
-        """Branch name for the run dir, matching the other projects' scheme.
+        """Branch name for the run dir.
 
-        Prefers the remote ref pointing at HEAD so a Beekeeper run (detached
-        after fetching) still names its branch; falls back to the local branch.
+        Prefers the remote ref at HEAD so a Beekeeper run (detached after
+        fetching) still names its branch; falls back to the local branch.
         """
         try:
             refs = subprocess.check_output(
@@ -484,10 +438,8 @@ class Agent:
     def train(self, steps, batch_size, eval_every=None, n_eval=10,
               eval_max_steps=300, eval_env_num=10, log_dir="runs",
               run_tag=None, save_every=10000):
-        # Timestamped run dir: TensorBoard's whole point is overlaying runs, so
-        # they must not overwrite each other. Name matches the convention in
-        # sac-homebot-route-planner / q-homebot-route-planner so one
-        # `tensorboard --logdir` habit works across projects.
+        # Timestamped run dir so runs overlay instead of overwriting. Naming
+        # matches sac-/q-homebot-route-planner.
         if run_tag is None:
             run_tag = self._run_tag()
         run_dir = os.path.join(
@@ -496,9 +448,8 @@ class Agent:
         print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
               flush=True)
 
-        # "steps", not epochs: get_batch samples with replacement, so there are
-        # no epoch boundaries. 100k steps at batch 32 is ~632 effective passes
-        # over the 5068-transition dataset.
+        # Steps, not epochs: get_batch samples with replacement, so there are no
+        # epoch boundaries. 100k steps at batch 32 is ~632 passes over 5068.
         for i in range(steps):
             batch = self.dl.get_batch(batch_size=batch_size)
 
@@ -517,30 +468,24 @@ class Agent:
                 print(f"step {i} loss {loss.item():.4f}")
                 writer.add_scalar("train/l1_loss", loss.item(), i)
 
-            # Periodic, unconditional save -- the checkpoint on disk is always
-            # the LATEST weights, not the lowest-loss ones. Run 427 measured why
-            # that matters: loss kept falling for 50k steps after success rate
-            # went flat, so best-loss selection was picking a model that scored
-            # worse than earlier ones it had already discarded.
+            # Latest weights, not lowest-loss: run 427 saw loss fall for 50k
+            # steps after success rate went flat, so best-loss selection was
+            # discarding better policies.
             if save_every and i > 0 and i % save_every == 0:
                 self.model.save_checkpoint()
                 print(f"step {i} saved {self.model.checkpoint_file}", flush=True)
 
-            # Same code path as standalone eval, so the two cannot drift.
-            # eval_max_steps is shorter than the standalone default: median
-            # success is ~108 steps, so 300 only truncates rollouts that were
-            # going to fail, and halves the cost of the early evals where
-            # nothing succeeds and every rollout runs to the cap.
+            # eval_max_steps=300 vs the standalone 600: median success is ~108
+            # steps, so this only truncates rollouts that were going to fail.
             if eval_every and i > 0 and i % eval_every == 0:
                 self._log_eval(writer, i, n_eval, eval_max_steps, eval_env_num)
 
-        # Save before the final eval, not after: eval builds envs and can fail,
-        # and losing the finished weights to a rendering error would be absurd.
+        # Before the final eval, not after -- eval builds envs and can fail.
         self.model.save_checkpoint()
         print(f"step {steps} saved {self.model.checkpoint_file}", flush=True)
 
-        # range(steps) stops at steps-1, so the loop above never evaluates the
-        # final model. Score it explicitly rather than finishing untested.
+        # range(steps) stops at steps-1, so the loop never scores the final
+        # model.
         if eval_every:
             self._log_eval(writer, steps, n_eval, eval_max_steps, eval_env_num)
 

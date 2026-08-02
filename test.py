@@ -5,24 +5,21 @@
     python test.py --scenes 6,23,41     # specific scenes
     python test.py --ckpt checkpoints/run428_ablation_b256
 
-This is a VIEW of the eval, not a separate measurement: every rollout runs
-through Agent.evaluate, so a scene you see succeed is a scene eval.py counts.
-The printed tally is a liveness read -- for a number, use eval.py --n-eval 50.
-
-Verify the two agree with:
+A view of the eval, not a separate measurement: every rollout runs through
+Agent.evaluate, so a scene you see succeed is one eval.py counts. The printed
+tally is a liveness read -- for a number, use eval.py --n-eval 50. The two
+agree scene for scene:
 
     python test.py --scenes 0,10,20,30,40
     python eval.py --scenes 0,10,20,30,40
 """
 import os
 
-# Must precede the agent import: mujoco picks its rendering backend when it is
-# imported, and the conda env sets MUJOCO_GL=egl for headless work, which
-# cannot open a window.
+# Must precede the agent import -- mujoco picks its backend at import, and the
+# conda env sets MUJOCO_GL=egl, which cannot open a window.
 os.environ["MUJOCO_GL"] = "glfw"
-# PYOPENGL_PLATFORM must be unset or "egl" -- robosuite raises ImportError on
-# anything else (renderers/context/egl_context.py). The conda env sets it to
-# egl, so clear it rather than point it at glfw.
+# Must be unset or "egl"; robosuite raises ImportError on anything else
+# (renderers/context/egl_context.py).
 os.environ.pop("PYOPENGL_PLATFORM", None)
 
 import argparse  # noqa: E402

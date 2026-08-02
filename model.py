@@ -15,7 +15,7 @@ class Model(nn.Module):
     def __init__(self, image_input_shape, joint_input_dim, num_actions, hidden_dim, checkpoint_dir='checkpoints', name='bc_network'):
         super(Model, self).__init__()
 
-        compression_dim = hidden_dim / 2
+        compression_dim = int(hidden_dim / 2)
 
         self.conv1 = nn.Conv2d(image_input_shape[0], 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
@@ -53,13 +53,13 @@ class Model(nn.Module):
 
     def forward(self, obs, joint_state):
         x_image = self._conv_forward(obs)
-        x_image = self.relu(self.image_input(x_image))
+        x_image = F.relu(self.image_input(x_image))
 
-        x_joint = self.relu(self.joint_input(joint_state))
+        x_joint = F.relu(self.joint_input(joint_state))
 
-        x = torch.cat([x_image, x_joint])
+        x = torch.cat([x_image, x_joint], dim=1)
 
-        x = self.relu(self.compression_layer(x))
+        x = F.relu(self.compression_layer(x))
 
         x = F.relu(self.linear1(x))
         x = F.tanh(self.output(x))

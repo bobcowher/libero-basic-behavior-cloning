@@ -16,12 +16,8 @@ CKPT_DIR = "checkpoints"
 
 
 def latest_ckpt():
-    """Newest file in checkpoints/ by mtime.
-
-    Covers both sources without a second mechanism: training writes there, and
-    download_models.sh drops run-tagged files there, so "newest" is whichever
-    model you most recently trained or pulled.
-    """
+    """Newest file in checkpoints/ by mtime -- whichever model you most
+    recently trained or pulled with download_models.sh."""
     if os.path.isdir(CKPT_DIR):
         files = [os.path.join(CKPT_DIR, f) for f in os.listdir(CKPT_DIR)]
         files = [f for f in files if os.path.isfile(f)]
@@ -31,11 +27,9 @@ def latest_ckpt():
 
 
 def parse_scenes(spec):
-    """"0,10,20" or "0-9" or a mix -> [0, 10, 20] / [0..9].
+    """"0,10,20" or "0-9" or a mix -> a list of scene indices.
 
-    Shared with test.py so the two entry points name scenes identically. That
-    is what makes `eval.py --scenes 0,10,20` the direct check on what
-    `test.py --scenes 0,10,20` just showed you.
+    Shared with test.py so both entry points name scenes identically.
     """
     out = []
     for part in spec.split(","):
@@ -69,8 +63,7 @@ def main():
 
     agent = Agent(task_id=args.task, ckpt=ckpt)
     print(f"task {args.task}: {agent.task.language}")
-    # Always name the weights being scored. A silently-chosen checkpoint is how
-    # you end up attributing one model's number to another.
+    # Always name the weights being scored.
     print(f"checkpoint: {ckpt}")
 
     if not args.zero_action:
@@ -85,9 +78,7 @@ def main():
         zero_action=args.zero_action,
     )
     print(result)
-    # Which scenes, not just how many. A single scene replayed looks like a
-    # working policy; this names the ones that actually work, so you can watch
-    # them with `test.py --scenes N`.
+    # Which scenes, not just how many -- watch them with `test.py --scenes N`.
     print(f"solved scenes: {result.solved}")
 
 
