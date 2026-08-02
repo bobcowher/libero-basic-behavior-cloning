@@ -124,6 +124,7 @@ class Agent:
 
             obs = env.reset()[0]
             proprio_dim = self._proprio(obs).shape[0]
+            print(obs)
             h, w, c = obs["agentview_image"].shape     # -> (C,H,W) for the model
             return action_dim, proprio_dim, (c, h, w)
         finally:
