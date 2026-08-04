@@ -74,13 +74,18 @@ class EvalResult:
 
 class Agent:
 
-    def __init__(self, task_id=0, lr=1e-4, device=None,
+    def __init__(self, task_id=0, task_ids=None, lr=1e-4, device=None,
                  ckpt="checkpoints/bc_network", benchmark_name="libero_spatial"):
+        # task_ids is the set to train on; task_id is the single-task shorthand
+        # and stays the default for scoring and watching.
         self.task_id = task_id
+        self.task_ids = [task_id] if task_ids is None else list(task_ids)
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.task_suite = benchmark.get_benchmark_dict()[benchmark_name]()
-        self.task = self.task_suite.get_task(task_id)
+        self.tasks = {t: self.task_suite.get_task(t) for t in self.task_ids}
+        if task_id not in self.tasks:
+            self.tasks[task_id] = self.task_suite.get_task(task_id)
 
         # What we configure the env's cameras to -- an input, not a derived value.
         self.img_size = 128
@@ -103,6 +108,11 @@ class Agent:
         # Must follow the camera and size settings -- it builds an env.
         self.action_dim, self.proprio_dim, image_shape = self._probe_dims()
 
+        # Embed over the whole suite, not just the trained subset, so the raw
+        # task_id indexes the embedding directly and no id remapping exists.
+        # Ten unused rows cost 2560 params.
+        self.n_tasks = self.task_suite.n_tasks
+
         # --- Architecture knobs (parametric sweep) -----------------------
         # Each experiment branch edits ONLY these three numbers. Baseline is
         # hidden_dim=256, compression_dim=256 (tied), n_hidden_layers=1.
@@ -115,6 +125,7 @@ class Agent:
             image_input_shape=image_shape,
             joint_input_dim=self.proprio_dim,
             num_actions=self.action_dim,
+            n_tasks=self.n_tasks,
             hidden_dim=self.hidden_dim,
             compression_dim=self.compression_dim,
             n_hidden_layers=self.n_hidden_layers,
@@ -124,6 +135,11 @@ class Agent:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         self._dl = None
+
+    @property
+    def task(self):
+        """The single task being scored or watched, unless one is named."""
+        return self.tasks[self.task_id]
 
     # ---- shapes ----------------------------------------------------------
     @staticmethod
@@ -157,8 +173,9 @@ class Agent:
     @property
     def dl(self):
         if self._dl is None:
-            demo_path = self.task_suite.get_task_demonstration(self.task_id)
-            self._dl = DataLoader(dataset_filename=demo_path, device=self.device)
+            demos = {t: self.task_suite.get_task_demonstration(t)
+                     for t in self.task_ids}
+            self._dl = DataLoader(dataset_filenames=demos, device=self.device)
         return self._dl
 
     def load_checkpoint(self):
@@ -191,8 +208,8 @@ class Agent:
                 torch.from_numpy(proprio).to(self.device))
 
     @torch.no_grad()
-    def _act(self, raw_obs):
-        """Actions for a list of live obs dicts.
+    def _act(self, raw_obs, task_id):
+        """Actions for a list of live obs dicts, all running the same task.
 
         One observation at a time, even with several envs in flight: batched
         conv reductions are batch-size dependent (~1e-8 even without TF32), and
@@ -200,27 +217,30 @@ class Agent:
         step dominates wall clock, so this costs nothing that matters.
         """
         images, proprio = self._preprocess_obs(raw_obs)
+        tid = torch.full((1,), task_id, dtype=torch.long, device=self.device)
         return np.stack([
-            self.model(images[i:i + 1], proprio[i:i + 1])[0].cpu().numpy()
+            self.model(images[i:i + 1], proprio[i:i + 1], tid)[0].cpu().numpy()
             for i in range(images.shape[0])
         ])
 
-    def _init_states(self):
-        """The benchmark's 50 fixed eval init states.
+    def _init_states(self, task_id=None):
+        """A task's 50 fixed eval init states.
 
         Replicates benchmark.get_task_init_states (benchmark/__init__.py:158)
         rather than calling it: that helper omits weights_only, which torch
         >= 2.6 defaults to True, rejecting the numpy pickle. Safe here -- local
         benchmark data, not a downloaded checkpoint.
         """
+        task = self.tasks[self.task_id if task_id is None else task_id]
         path = os.path.join(get_libero_path("init_states"),
-                            self.task.problem_folder, self.task.init_states_file)
+                            task.problem_folder, task.init_states_file)
         return torch.load(path, weights_only=False)
 
     # ---- env -------------------------------------------------------------
-    def _build_env(self, env_num, seed, render=False):
+    def _build_env(self, env_num, seed, render=False, task_id=None):
+        task = self.tasks[self.task_id if task_id is None else task_id]
         bddl = os.path.join(get_libero_path("bddl_files"),
-                            self.task.problem_folder, self.task.bddl_file)
+                            task.problem_folder, task.bddl_file)
         env_args = {"bddl_file_name": bddl,
                     "camera_heights": self.img_size, "camera_widths": self.img_size}
 
@@ -321,8 +341,8 @@ class Agent:
             writer.release()
 
     # ---- eval ------------------------------------------------------------
-    def _rollout(self, env, batch, max_steps, render=False, zero_action=False,
-                 capture=False):
+    def _rollout(self, env, batch, max_steps, task_id, render=False,
+                 zero_action=False, capture=False):
         """One batch of rollouts on a fresh env. THE rollout loop.
 
         Every rollout runs here -- scored, watched, recorded. Variations are
@@ -340,7 +360,8 @@ class Agent:
             obs = env.reset()
         else:
             env.reset()
-            obs = env.set_init_state(self._init_states()[np.array(batch)])
+            obs = env.set_init_state(
+                self._init_states(task_id)[np.array(batch)])
             for _ in range(self.settle_steps):
                 obs, _, _, _ = env.step(np.zeros((n, self.action_dim)))
 
@@ -357,7 +378,7 @@ class Agent:
             if zero_action:
                 actions = np.zeros((n, self.action_dim))
             else:
-                actions = self._act(obs)
+                actions = self._act(obs, task_id)
                 assert actions.shape == (n, self.action_dim), (
                     f"policy returned {actions.shape}, "
                     f"expected {(n, self.action_dim)}"
@@ -383,8 +404,13 @@ class Agent:
         return dones, done_step, frames
 
     def evaluate(self, n_eval=50, max_steps=600, env_num=1, seed=0,
-                 zero_action=False, record_dir=None, scenes=None, render=False):
-        """Rollout success rate from the benchmark's fixed init states.
+                 zero_action=False, record_dir=None, scenes=None, render=False,
+                 task_id=None):
+        """Rollout success rate from one task's fixed init states.
+
+        One task per call -- a task's scene indices only mean something next to
+        its own task_id, so mixing them into a single EvalResult would produce a
+        number nothing can be traced back from. evaluate_tasks() aggregates.
 
         scenes names the init states to run; n_eval is shorthand for the first
         n. zero_action sends zeros instead of model output -- a smoke test that
@@ -400,8 +426,11 @@ class Agent:
         was_training = self.model.training
         self.model.eval()
 
+        task_id = self.task_id if task_id is None else task_id
+
         if scenes is None:
-            scenes = [i % self._init_states().shape[0] for i in range(n_eval)]
+            scenes = [i % self._init_states(task_id).shape[0]
+                      for i in range(n_eval)]
         else:
             scenes = list(scenes)
 
@@ -411,10 +440,11 @@ class Agent:
             batch = scenes[i:i + env_num]
             # Sized to the batch so a short final one is not padded. Safe only
             # because outcomes no longer depend on how many envs share a step.
-            env = self._build_env(len(batch), seed, render=render)
+            env = self._build_env(len(batch), seed, render=render,
+                                  task_id=task_id)
             try:
                 dones, done_step, frames = self._rollout(
-                    env, batch, max_steps, render=render,
+                    env, batch, max_steps, task_id, render=render,
                     zero_action=zero_action, capture=record_dir is not None)
 
                 if frames is not None:
@@ -422,8 +452,10 @@ class Agent:
                     for k, scene in enumerate(batch):
                         tag = "success" if dones[k] else "fail"
                         name = "ref" if scene is None else f"{scene:02d}"
+                        # Task in the name: scene indices repeat across tasks,
+                        # so without it a multi-task sweep overwrites itself.
                         path = os.path.join(
-                            record_dir, f"scene{name}_{tag}.mp4")
+                            record_dir, f"task{task_id:02d}_scene{name}_{tag}.mp4")
                         self._write_video(path, frames[k])
                         print(f"  wrote {path} ({len(frames[k])} frames)",
                               flush=True)
@@ -438,6 +470,15 @@ class Agent:
             self.model.train()
 
         return EvalResult(scenes, successes, steps_to_success)
+
+    def evaluate_tasks(self, task_ids=None, **kw):
+        """Score every trained task. Returns {task_id: EvalResult}.
+
+        The headline number is the mean over tasks, not over pooled rollouts --
+        equal weight per task even if a task gets fewer scenes.
+        """
+        task_ids = self.task_ids if task_ids is None else list(task_ids)
+        return {t: self.evaluate(task_id=t, **kw) for t in task_ids}
 
     # ---- train -----------------------------------------------------------
     def _run_tag(self):
@@ -470,7 +511,7 @@ class Agent:
         # Encode the swept architecture in the run name so TensorBoard shows
         # what was tested at a glance (e.g. ..._exp-hdim-128_h128_c128_L1).
         arch = f"h{self.hidden_dim}_c{self.compression_dim}_L{self.n_hidden_layers}"
-        run_tag = f"{run_tag}_{arch}"
+        run_tag = f"{run_tag}_{arch}_T{len(self.task_ids)}"
         run_dir = os.path.join(
             log_dir, f'{time.strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}')
         writer = SummaryWriter(run_dir)
@@ -478,6 +519,11 @@ class Agent:
             "config/arch",
             f"hidden_dim={self.hidden_dim}  compression_dim={self.compression_dim}"
             f"  n_hidden_layers={self.n_hidden_layers}", 0)
+        writer.add_text(
+            "config/tasks",
+            f"task_ids={self.task_ids}  n_tasks={self.n_tasks}\n\n"
+            + "\n".join(f"[{t}] {self.tasks[t].language}" for t in self.task_ids),
+            0)
         print(f"logging to {run_dir}  ->  tensorboard --logdir {log_dir}",
               flush=True)
 
@@ -489,8 +535,9 @@ class Agent:
             images = batch[self.policy_cam_batch].to(self.device)
             joint_states = batch["joint_state"].to(self.device)
             actions = batch["actions"].to(self.device)
+            task_ids = batch["task_id"].to(self.device)
 
-            actions_pred = self.model(images, joint_states)
+            actions_pred = self.model(images, joint_states, task_ids)
             loss = F.l1_loss(actions_pred, actions)
 
             self.optimizer.zero_grad()
@@ -525,12 +572,31 @@ class Agent:
         writer.close()
 
     def _log_eval(self, writer, step, n_eval, max_steps, env_num):
-        result = self.evaluate(n_eval=n_eval, max_steps=max_steps,
-                               env_num=env_num)
-        print(f"step {step} {result}", flush=True)
-        writer.add_scalar("eval/success_rate", result.success_rate, step)
-        solved = [s for s in result.steps_to_success if s is not None]
+        results = self.evaluate_tasks(n_eval=n_eval, max_steps=max_steps,
+                                      env_num=env_num)
+
+        # Mean over tasks. With one task this is the old scalar unchanged, so
+        # single-task runs stay comparable to everything logged before.
+        rates = [r.success_rate for r in results.values()]
+        mean_rate = sum(rates) / len(rates)
+        writer.add_scalar("eval/success_rate", mean_rate, step)
+
+        solved = [s for r in results.values()
+                  for s in r.steps_to_success if s is not None]
         if solved:
             writer.add_scalar("eval/median_steps", float(np.median(solved)), step)
+
+        if len(results) > 1:
+            # Per-task curves: a mean that holds still can still hide one task
+            # collapsing while another improves.
+            for t, r in results.items():
+                writer.add_scalar(f"eval/task{t:02d}/success_rate",
+                                  r.success_rate, step)
+            per_task = "  ".join(f"t{t}:{r.success_rate:.0%}"
+                                 for t, r in results.items())
+            print(f"step {step} mean {mean_rate:.1%}  [{per_task}]", flush=True)
+        else:
+            print(f"step {step} {next(iter(results.values()))}", flush=True)
+
         writer.flush()
-        return result
+        return results

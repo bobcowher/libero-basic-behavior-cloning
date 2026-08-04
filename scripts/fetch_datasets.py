@@ -23,14 +23,16 @@ import sys
 
 HF_REPO_ID = "yifengzhu-hf/LIBERO-datasets"   # download_utils.py:108
 
-# Must match the task Agent trains on (agent.py: benchmark_name + task_id).
+# Must cover every task Agent trains on (agent.py: benchmark_name + task_ids).
 # Duplicated here because resolving it through the benchmark needs torch, which
 # is not installed yet when this runs. A mismatch fails loudly in DataLoader
 # with a missing-file error, not silently.
-DEFAULT_PATTERN = (
-    "libero_spatial/pick_up_the_black_bowl_between_the_plate_and_the_ramekin"
-    "_and_place_it_on_the_plate_demo.hdf5"
-)
+#
+# The whole suite, ~5.9GB: train.py trains all 10 libero_spatial tasks. That is
+# well past Beekeeper's 300s setup timeout on a cold box -- the download resumes
+# where it stopped, so the first launch may need to be retried until it
+# completes. A single task was ~486MB.
+DEFAULT_PATTERN = "libero_spatial/*"
 
 CONFIG_FILE = os.path.join(
     os.environ.get("LIBERO_CONFIG_PATH", os.path.expanduser("~/.libero")),
